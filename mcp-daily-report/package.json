@@ -1,0 +1,21 @@
+{
+  "name": "mcp-daily-report",
+  "version": "1.0.0",
+  "description": "MCP server for the Daily Report web app (Laravel 13 + Inertia): session login, page reading and data submission. Credentials stay in .env, never exposed to the model.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "daily-report",
+    "laravel",
+    "inertia"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^16.4.7"
+  }
+}

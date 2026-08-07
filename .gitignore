@@ -1,0 +1,15 @@
+# Dependencies (installed locally, never committed)
+node_modules/
+
+# Environment / secrets (per-machine, never committed)
+.env
+*.env.local
+
+# Logs
+*.log
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
