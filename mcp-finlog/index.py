@@ -576,9 +576,8 @@ def delete_category(
 if __name__ == "__main__":
     if not settings.database_url:
         print(
-            "[ERROR] DATABASE_URL is not set. Add it to the environment or to "
-            "mcp-finlog/.env before starting the server.",
+            "[WARN] DATABASE_URL is not set; tools will return errors until it "
+            "is configured. Add it to the environment or mcp-finlog/.env.",
             file=sys.stderr,
         )
-        sys.exit(1)
     mcp.run()

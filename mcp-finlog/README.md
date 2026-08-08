@@ -39,7 +39,8 @@ FinlogBot behavior). Per tool call:
 
 A user that does not exist yet is created on first use (`username="mcp"`,
 `first_name="MCP"`). `FINLOG_TELEGRAM_USER_ID` is therefore only a fallback and
-is no longer required at startup — only `DATABASE_URL` is.
+no environment variable is required at startup: the server boots even without
+`DATABASE_URL` and every tool returns an `[ERROR]` until it is configured.
 
 **Category scope note:** `category` data (list/add/update/delete) is currently
 **shared** across users — the `categories` table has no per-user column yet (the
@@ -51,10 +52,11 @@ on the shared category set.
 
 | Variable | Description |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string shared with FinlogBot (required) |
+| `DATABASE_URL` | PostgreSQL connection string shared with FinlogBot (required for tools; the server boots without it and tools return `[ERROR]` until it is set) |
 | `FINLOG_TELEGRAM_USER_ID` | Telegram user id used as a fallback when a tool call does not pass `telegram_user_id` (optional). If the user does not exist yet, the server creates it (`username="mcp"`, `first_name="MCP"`) |
 
-Both are read from the process env or from `mcp-finlog/.env`. If `DATABASE_URL` is missing, the server prints a clear error to stderr and exits with code 1.
+Both are read from the process env or from `mcp-finlog/.env`. If `DATABASE_URL`
+is missing, the server prints a warning to stderr and keeps running.
 
 ## Setup & run
 
