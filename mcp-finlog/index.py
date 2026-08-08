@@ -90,12 +90,70 @@ def _is_master(telegram_user_id: int) -> bool:
         return False
 
 
-def _resolve_user(telegram_user_id: int | None) -> int:
+def _timezone_default_for(language_code: Optional[str]) -> Optional[str]:
+    """Map a language code to its default timezone; None when absent/unmapped.
+
+    Replicates FinlogBot's LanguageLocale.default_timezone mapping, but unlike
+    _default_timezone_for it returns None (not "UTC") for unknown/absent
+    languages — the server falls back to "UTC" at read time anyway.
+    """
+    if not language_code:
+        return None
+    return _LANGUAGE_DEFAULT_TIMEZONES.get(language_code.lower())
+
+
+def _sync_user_profile(
+    user: User,
+    username: Optional[str],
+    first_name: Optional[str],
+    last_name: Optional[str],
+    language_code: Optional[str],
+) -> bool:
+    """Sync a user's profile fields from incoming Telegram data.
+
+    Replicates FinlogBot's _ensure_user sync loop: only provided fields (not
+    None) are considered, and each is applied when it differs from the stored
+    value. A language-derived timezone is only set when the user has no
+    timezone yet. Currency is intentionally never touched here (the add_*
+    tools require the user to confirm it). Returns True when the user changed.
+    """
+    updated = False
+    for field, new_value in (
+        ("username", username),
+        ("first_name", first_name),
+        ("last_name", last_name),
+    ):
+        if new_value is not None and getattr(user, field) != new_value:
+            setattr(user, field, new_value)
+            updated = True
+    if language_code is not None and user.language_code != language_code:
+        user.language_code = language_code
+        updated = True
+    if user.timezone is None and language_code:
+        default_timezone = _timezone_default_for(language_code)
+        if default_timezone is not None:
+            user.timezone = default_timezone
+            updated = True
+    return updated
+
+
+def _resolve_user(
+    telegram_user_id: int | None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
+) -> int:
     """Resolve (find-or-create) the Finlog user for a single tool call.
 
     Uses the caller-provided telegram_user_id when given; otherwise falls back
-    to the FINLOG_TELEGRAM_USER_ID env var. Raises ValueError (converted to an
-    "[ERROR] ..." string by the tools) when no user can be identified.
+    to the FINLOG_TELEGRAM_USER_ID env var. New users are created with the
+    caller's Telegram profile (falling back to "mcp"/"MCP" when no profile is
+    provided); a language-derived timezone is set when the language maps to one,
+    and currency is intentionally left unset (the add_* tools require the user
+    to confirm it first). Existing users are synced when the provided profile
+    differs. Raises ValueError (converted to an "[ERROR] ..." string by the
+    tools) when no user can be identified.
     """
     telegram_id = _effective_telegram_id(telegram_user_id)
 
@@ -109,9 +167,11 @@ def _resolve_user(telegram_user_id: int | None) -> int:
                     User(
                         id=None,
                         telegram_user_id=telegram_id,
-                        username="mcp",
-                        first_name="MCP",
-                        last_name=None,
+                        username=username or "mcp",
+                        first_name=first_name or "MCP",
+                        last_name=last_name,
+                        language_code=language_code,
+                        timezone=_timezone_default_for(language_code),
                     )
                 )
             except IntegrityError:
@@ -120,23 +180,40 @@ def _resolve_user(telegram_user_id: int | None) -> int:
                 user = user_repo.get_by_telegram_id(telegram_id)
                 if user is None:
                     raise
+        elif _sync_user_profile(user, username, first_name, last_name, language_code):
+            user.updated_at = datetime.now(UTC)
+            user_repo.update(user)
         return user.id
     finally:
         session.close()
 
 
 def _resolve_target(
-    telegram_user_id: int | None, target_telegram_user_id: int | None
+    telegram_user_id: int | None,
+    target_telegram_user_id: int | None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
 ) -> int:
     """Resolve the user whose data a tool operates on.
 
     telegram_user_id is the CALLER (used for authorization); when
     target_telegram_user_id is omitted it defaults to the caller's own data.
     Operating on another user's data is only allowed when the caller is the
-    master admin (FINLOG_MASTER_TELEGRAM_ID). Raises ValueError (converted to
-    an "[ERROR] ..." string by the tools) when access is denied.
+    master admin (FINLOG_MASTER_TELEGRAM_ID). The caller's Telegram profile
+    (username/first_name/last_name/language_code) is forwarded to _resolve_user
+    for creating/syncing the caller's user; the target has no profile, so it is
+    resolved without one. Raises ValueError (converted to an "[ERROR] ..."
+    string by the tools) when access is denied.
     """
-    caller_user_id = _resolve_user(telegram_user_id)
+    caller_user_id = _resolve_user(
+        telegram_user_id,
+        username=username,
+        first_name=first_name,
+        last_name=last_name,
+        language_code=language_code,
+    )
     caller_telegram_id = _effective_telegram_id(telegram_user_id)
     if target_telegram_user_id is None:
         return caller_user_id
@@ -296,6 +373,10 @@ def _category_to_dict(category: CategoryModel) -> Dict[str, Any]:
 def add_expense(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
@@ -305,10 +386,18 @@ def add_expense(
     """Record an expense. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         if amount <= 0:
             return _error("Amount must be greater than 0.")
         with _session_scope() as session:
@@ -351,6 +440,10 @@ def add_expense(
 def add_income(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
@@ -360,10 +453,18 @@ def add_income(
     """Record an income. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         if amount <= 0:
             return _error("Amount must be greater than 0.")
         with _session_scope() as session:
@@ -406,6 +507,10 @@ def add_income(
 def add_loan(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
@@ -414,10 +519,18 @@ def add_loan(
     """Record a loan (no category). Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         if amount <= 0:
             return _error("Amount must be greater than 0.")
         with _session_scope() as session:
@@ -457,6 +570,10 @@ def add_loan(
 def list_transactions(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     type: Optional[str] = None,
     from_date: Optional[str] = None,
@@ -469,10 +586,18 @@ def list_transactions(
     """List transactions with filters (type, date range YYYY-MM-DD local, keyword, category) and pagination. Amounts are real VND.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         if page < 1:
             return _error("page must be >= 1.")
         if page_size < 1:
@@ -524,16 +649,28 @@ def list_transactions(
 def get_transaction(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     transaction_id: int,
 ) -> Any:
     """Get transaction details by id (including category name). Amount is real VND.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.get_by_id(transaction_id)
@@ -553,16 +690,28 @@ def get_transaction(
 def delete_transactions(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     transaction_ids: list[int],
 ) -> Any:
     """Delete transactions by ids; returns the number of transactions deleted.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             transactions = repo.get_by_ids(transaction_ids)
@@ -577,6 +726,10 @@ def delete_transactions(
 def update_transaction_category(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     transaction_ids: list[int],
     category_id: Optional[int] = None,
@@ -584,10 +737,18 @@ def update_transaction_category(
     """Set or clear the category of existing transactions (batch, e.g. categorize old records). Pass category_id=None to clear it.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             if category_id is not None:
                 category_repo = SqlAlchemyCategoryRepository(session)
@@ -614,16 +775,28 @@ def update_transaction_category(
 def pay_loan(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     loan_id: int,
 ) -> Any:
     """Pay a loan: convert a loan transaction into an expense. Amount is real VND.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.get_by_id(loan_id)
@@ -655,6 +828,10 @@ def pay_loan(
 def get_report(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     from_date: str,
     to_date: str,
@@ -663,10 +840,18 @@ def get_report(
     """Report totals by type plus breakdown by category for a date range (YYYY-MM-DD local). Amounts are real VND.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         transaction_type = _parse_type(type)
         with _session_scope() as session:
             user = _load_user(session, user_id)
@@ -706,15 +891,27 @@ def get_report(
 def get_balance(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
 ) -> Any:
     """Current balance (total income minus total expense) in the user's currency.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             user = _load_user(session, user_id)
             if user is None:
@@ -731,15 +928,27 @@ def get_balance(
 def get_user_profile(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
 ) -> Any:
     """Return a user's profile (telegram_user_id, username, timezone, currency). Master can inspect other users via target_telegram_user_id.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user cần xem; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             user = _load_user(session, user_id)
             if user is None:
@@ -758,6 +967,10 @@ def get_user_profile(
 def update_user_settings(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int | None = None,
     timezone: Optional[str] = None,
     currency: Optional[str] = None,
@@ -765,10 +978,18 @@ def update_user_settings(
     """Update a user's timezone and/or currency. At least one of timezone/currency is required. Master can update other users via target_telegram_user_id.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user cần cập nhật; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         if timezone is None and currency is None:
             return _error("Phải truyền ít nhất một trong: timezone hoặc currency.")
         if timezone is not None:
@@ -812,12 +1033,17 @@ def update_user_settings(
 def search_users(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     query: str,
     limit: int = 20,
 ) -> Any:
     """[master only] Search users by telegram id (exact) or by username/first_name/last_name (substring). Returns [{telegram_user_id, username, first_name, last_name, timezone, currency}].
 
     telegram_user_id: Telegram user id của master; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     """
     try:
         if not _is_master(_effective_telegram_id(telegram_user_id)):
@@ -928,11 +1154,16 @@ def update_user(
 def delete_user(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     target_telegram_user_id: int,
 ) -> Any:
     """[master only] Delete a user and all their transactions. Cannot delete yourself or the master account.
 
     telegram_user_id: Telegram user id của master; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     target_telegram_user_id: Telegram user id của user cần xoá.
     """
     try:
@@ -977,13 +1208,24 @@ def delete_user(
 def list_categories(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
 ) -> Any:
     """List all categories, sorted by id. Returns [{id, name}].
 
     telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     """
     try:
-        _resolve_user(telegram_user_id)
+        _resolve_user(
+            telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             repo = SqlAlchemyCategoryRepository(session)
             return [_category_to_dict(c) for c in repo.list_all()]
@@ -995,14 +1237,25 @@ def list_categories(
 def add_category(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     name: str,
 ) -> Any:
     """Create a new category. The name must be unique.
 
     telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     """
     try:
-        _resolve_user(telegram_user_id)
+        _resolve_user(
+            telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         name = name.strip()
         if not name:
             return _error("Category name must not be empty.")
@@ -1023,15 +1276,26 @@ def add_category(
 def update_category(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     category_id: int,
     name: str,
 ) -> Any:
     """Rename a category. The new name must not collide with another category.
 
     telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     """
     try:
-        _resolve_user(telegram_user_id)
+        _resolve_user(
+            telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         name = name.strip()
         if not name:
             return _error("Category name must not be empty.")
@@ -1053,14 +1317,25 @@ def update_category(
 def delete_category(
     *,
     telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
     category_id: int,
 ) -> Any:
     """Delete a category. Transactions referencing it become NULL (FK ON DELETE SET NULL).
 
     telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
     """
     try:
-        _resolve_user(telegram_user_id)
+        _resolve_user(
+            telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
         with _session_scope() as session:
             repo = SqlAlchemyCategoryRepository(session)
             if repo.get_by_id(category_id) is None:

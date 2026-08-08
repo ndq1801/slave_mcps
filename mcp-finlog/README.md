@@ -48,6 +48,15 @@ A user that does not exist yet is created on first use (`username="mcp"`,
 no environment variable is required at startup: the server boots even without
 `DATABASE_URL` and every tool returns an `[ERROR]` until it is configured.
 
+Clients may pass the caller's Telegram profile as optional arguments —
+`username`, `first_name`, `last_name` and `language_code` (right after
+`telegram_user_id`). The server uses them to create a **real** user instead of
+the placeholder, and to **sync** an existing user's profile fields when they
+change (replicating FinlogBot's `_ensure_user`). A language-derived timezone is
+set when the user has none yet. Currency is **never** derived from the language:
+the `add_*` tools keep requiring the user to confirm it first. When no profile
+is passed, the old fallback (`username="mcp"`, `first_name="MCP"`) is kept.
+
 Every transaction-data tool also accepts `target_telegram_user_id: int | None`
 which selects **whose** data the tool operates on:
 
