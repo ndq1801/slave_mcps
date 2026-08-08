@@ -10,12 +10,12 @@ Amounts are **real VND** (the old bot's x1000 convention is **not** used here �
 |---|---|
 | `add_expense` | Record an expense (VND). Optional `category_id` and `date` |
 | `add_income` | Record an income (VND). Optional `category_id` and `date` |
-| `add_loan` | Record a loan (no category) |
+| `add_loan` | Record money you BORROWED (a debt you must repay, "đi vay") — not money you lent to others |
 | `list_transactions` | Filtered + paginated transaction list (type, date range, keyword, category), each item includes the category name |
 | `get_transaction` | Transaction detail by id, including category name |
 | `delete_transactions` | Delete transactions by ids; returns the number deleted |
 | `update_transaction_category` | Set or clear the category of existing transactions (batch, e.g. categorize old records) |
-| `pay_loan` | Pay a loan — converts a loan transaction into an expense (same logic as the bot's `/pay`) |
+| `pay_loan` | Repay a loan you BORROWED — converts the loan into an expense (same logic as the bot's `/pay`) |
 | `get_report` | Totals by type + breakdown by category for a date range |
 | `get_balance` | Current balance (income − expense) in VND |
 | `get_user_profile` | User profile `{telegram_user_id, username, timezone, currency}` (master can inspect other users) |

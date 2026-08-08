@@ -516,7 +516,7 @@ def add_loan(
     description: str,
     date: Optional[str] = None,
 ) -> Any:
-    """Record a loan (no category). Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
+    """Record money you BORROWED (a debt you must repay, "đi vay") - NOT money you lent to others. No category. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
     username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
@@ -782,7 +782,7 @@ def pay_loan(
     target_telegram_user_id: int | None = None,
     loan_id: int,
 ) -> Any:
-    """Pay a loan: convert a loan transaction into an expense. Amount is real VND.
+    """Repay a loan you BORROWED (debt you owe): converts the loan into an expense (money goes out to the lender). Amount is real VND.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
     username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
