@@ -11,6 +11,7 @@ class TransactionType(Enum):
     INCOME = "income"
     EXPENSE = "expense"
     LOAN = "loan"
+    LENDING = "lending"
 
 
 @dataclass

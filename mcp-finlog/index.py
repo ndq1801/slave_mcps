@@ -12,8 +12,10 @@ never raise exceptions to the MCP client.
 
 from __future__ import annotations
 
+import csv
 import os
 import sys
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -312,7 +314,7 @@ def _parse_type(value: Optional[str]) -> Optional[TransactionType]:
         return TransactionType(value.strip().lower())
     except ValueError:
         raise ValueError(
-            f"Invalid transaction type: {value!r}. Allowed: income, expense, loan."
+            f"Invalid transaction type: {value!r}. Allowed: income, expense, loan, lending."
         )
 
 
@@ -567,6 +569,69 @@ def add_loan(
 
 
 @mcp.tool()
+def add_lending(
+    *,
+    telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
+    target_telegram_user_id: int | None = None,
+    amount: float,
+    description: str,
+    date: Optional[str] = None,
+) -> Any:
+    """Record money you LENT to someone else (cho vay - a receivable you expect back). NOT money you borrowed (use add_loan for that). No category. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
+        if amount <= 0:
+            return _error("Amount must be greater than 0.")
+        with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            if not user.currency:
+                return _error(
+                    "User chưa cấu hình currency (đơn vị tiền tệ). Hãy hỏi user "
+                    "muốn dùng đơn vị nào (VD: VND, USD, JPY) rồi gọi "
+                    "update_user_settings để thiết lập trước khi ghi giao dịch."
+                )
+            tz = _zone_info_for(user)
+            transaction_date = _parse_date(date, tz)
+            repo = SqlAlchemyTransactionRepository(session)
+            tx = repo.create(
+                Transaction(
+                    id=None,
+                    user_id=user_id,
+                    type=TransactionType.LENDING,
+                    amount=float(amount),
+                    description=description,
+                    transaction_date=transaction_date,
+                    created_at=datetime.now(UTC),
+                    updated_at=None,
+                    category_id=None,
+                )
+            )
+            return _tx_to_dict(
+                tx, _load_category_names(session), tz=tz, currency=user.currency
+            )
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
 def list_transactions(
     *,
     telegram_user_id: int | None = None,
@@ -643,6 +708,141 @@ def list_transactions(
             }
     except Exception as exc:
         return _error(str(exc))
+
+
+@mcp.tool()
+def export_transactions(
+    *,
+    telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
+    target_telegram_user_id: int | None = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    format: str = "csv",
+) -> Any:
+    """Export the user's transactions to a FILE on disk (CSV with UTF-8 BOM, or XLSX) and return the marker '[FILE:<basename>]<absolute path>' so the bot can send the file via sendDocument. Amounts are real VND. Dates are YYYY-MM-DD local.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
+        if format not in ("csv", "xlsx"):
+            return _error(f"Unsupported format: {format!r}. Allowed: csv, xlsx.")
+        transaction_types = [_parse_type(transaction_type)] if transaction_type else None
+        with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            tz = _zone_info_for(user)
+            start = (
+                _parse_date(from_date, tz)
+                if from_date
+                else datetime(2000, 1, 1, tzinfo=UTC)
+            )
+            end = (
+                _parse_date_end(to_date, tz)
+                if to_date
+                else datetime(2100, 1, 1, tzinfo=UTC)
+            )
+            repo = SqlAlchemyTransactionRepository(session)
+            all_transactions: List[Transaction] = []
+            skip = 0
+            while True:
+                page, total = repo.get_by_user_and_date_range_with_filters(
+                    user_id,
+                    start,
+                    end,
+                    transaction_types=transaction_types,
+                    search_text=None,
+                    category_id=None,
+                    skip=skip,
+                    limit=500,
+                )
+                all_transactions.extend(page)
+                if len(all_transactions) >= total or not page:
+                    break
+                skip += len(page)
+            category_names = _load_category_names(session)
+            rows = [
+                _tx_to_dict(tx, category_names, tz=tz, currency=user.currency)
+                for tx in all_transactions
+            ]
+        export_dir = os.environ.get("EXPORT_DIR", "").strip() or tempfile.gettempdir()
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        basename = f"finlog_export_{timestamp}.{format}"
+        path = os.path.join(export_dir, basename)
+        if format == "csv":
+            _write_export_csv(path, rows)
+        else:
+            _write_export_xlsx(path, rows)
+        return f"[FILE:{basename}]{path}"
+    except Exception as exc:
+        return _error(str(exc))
+
+
+def _write_export_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    """Write transaction dicts to a UTF-8 BOM CSV file (Excel-friendly)."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            ["id", "type", "amount", "currency", "description",
+             "transaction_date", "category", "created_at", "updated_at"]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["id"],
+                    row["type"],
+                    row["amount"],
+                    row["currency"],
+                    row["description"],
+                    row["transaction_date"],
+                    row["category_name"],
+                    row["created_at"],
+                    row["updated_at"],
+                ]
+            )
+
+
+def _write_export_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
+    """Write transaction dicts to a real .xlsx file via openpyxl."""
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "transactions"
+    sheet.append(
+        ["id", "type", "amount", "currency", "description",
+         "transaction_date", "category", "created_at", "updated_at"]
+    )
+    for row in rows:
+        sheet.append(
+            [
+                row["id"],
+                row["type"],
+                float(row["amount"]),
+                row["currency"],
+                row["description"],
+                row["transaction_date"],
+                row["category_name"],
+                row["created_at"],
+                row["updated_at"],
+            ]
+        )
+    workbook.save(path)
 
 
 @mcp.tool()
@@ -825,6 +1025,142 @@ def pay_loan(
 
 
 @mcp.tool()
+def collect_lending(
+    *,
+    telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
+    target_telegram_user_id: int | None = None,
+    lending_id: int,
+) -> Any:
+    """Collect a loan you LENT: converts the lending into an income (money received back from the borrower). Amount is real VND.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
+        with _session_scope() as session:
+            repo = SqlAlchemyTransactionRepository(session)
+            tx = repo.get_by_id(lending_id)
+            if tx is None or tx.user_id != user_id:
+                return _error(f"Transaction {lending_id} not found.")
+            if tx.type != TransactionType.LENDING:
+                return _error(f"Transaction {lending_id} is not a lending; only lendings can be collected.")
+            updated = repo.update_many(
+                [lending_id],
+                {
+                    "type": TransactionType.INCOME.value,
+                    "updated_at": datetime.now(UTC),
+                },
+            )
+            if updated != 1:
+                return _error(f"Failed to convert transaction {lending_id}.")
+            collected = repo.get_by_id(lending_id)
+            user = _load_user(session, user_id)
+            tz = _zone_info_for(user) if user else UTC
+            currency = user.currency if user else None
+            return _tx_to_dict(
+                collected, _load_category_names(session), tz=tz, currency=currency
+            )
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def add_transactions_bulk(
+    *,
+    telegram_user_id: int | None = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
+    target_telegram_user_id: int | None = None,
+    transactions: list,
+) -> Any:
+    """Batch import transactions in ONE insert (e.g. restoring old records). Each item: {type: income|expense|loan|lending, amount, description, date?, category_id?}. Valid rows are inserted together; per-row validation errors are returned in the summary. A hard [ERROR] is returned only when the user or currency cannot be resolved.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(
+            telegram_user_id,
+            target_telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            language_code=language_code,
+        )
+        errors: List[str] = []
+        valid: List[Transaction] = []
+        with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            if not user.currency:
+                return _error(
+                    "User chưa cấu hình currency (đơn vị tiền tệ). Hãy hỏi user "
+                    "muốn dùng đơn vị nào (VD: VND, USD, JPY) rồi gọi "
+                    "update_user_settings để thiết lập trước khi ghi giao dịch."
+                )
+            tz = _zone_info_for(user)
+            category_repo = SqlAlchemyCategoryRepository(session)
+            for index, row in enumerate(transactions or []):
+                try:
+                    row_type = _parse_type(row.get("type"))
+                    if row_type is None:
+                        raise ValueError("type is required")
+                    amount = row.get("amount")
+                    if amount is None:
+                        raise ValueError("amount is required")
+                    amount = float(amount)
+                    if amount <= 0:
+                        raise ValueError("amount must be greater than 0")
+                    description = row.get("description")
+                    if not isinstance(description, str):
+                        raise ValueError("description is required")
+                    category_id = row.get("category_id")
+                    if (
+                        category_id is not None
+                        and category_repo.get_by_id(category_id) is None
+                    ):
+                        raise ValueError(f"category {category_id} does not exist")
+                    transaction_date = _parse_date(row.get("date"), tz)
+                    valid.append(
+                        Transaction(
+                            id=None,
+                            user_id=user_id,
+                            type=row_type,
+                            amount=amount,
+                            description=description,
+                            transaction_date=transaction_date,
+                            created_at=datetime.now(UTC),
+                            updated_at=None,
+                            category_id=category_id,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(f"row {index}: {exc}")
+            repo = SqlAlchemyTransactionRepository(session)
+            inserted = len(repo.create_many(valid))
+            return {"inserted": inserted, "errors": errors}
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
 def get_report(
     *,
     telegram_user_id: int | None = None,
@@ -865,8 +1201,8 @@ def get_report(
             by_category = []
             if transaction_type is None:
                 breakdown_types = [TransactionType.EXPENSE, TransactionType.INCOME]
-            elif transaction_type == TransactionType.LOAN:
-                breakdown_types = []  # loans have no category
+            elif transaction_type in (TransactionType.LOAN, TransactionType.LENDING):
+                breakdown_types = []  # loans/lendings have no category
             else:
                 breakdown_types = [transaction_type]
             for t in breakdown_types:

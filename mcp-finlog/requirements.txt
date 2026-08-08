@@ -3,3 +3,4 @@ sqlalchemy>=2.0
 psycopg2-binary
 pydantic-settings
 tzdata  # required by Python zoneinfo on Windows
+openpyxl  # required by export_transactions (xlsx format)

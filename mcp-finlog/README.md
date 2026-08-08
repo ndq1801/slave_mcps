@@ -11,11 +11,15 @@ Amounts are **real VND** (the old bot's x1000 convention is **not** used here �
 | `add_expense` | Record an expense (VND). Optional `category_id` and `date` |
 | `add_income` | Record an income (VND). Optional `category_id` and `date` |
 | `add_loan` | Record money you BORROWED (a debt you must repay, "đi vay") — not money you lent to others |
+| `add_lending` | Record money you LENT to someone else (cho vay — a receivable you expect back) — not money you borrowed; no category |
+| `collect_lending` | Collect a loan you LENT — converts the lending into an income (money received back from the borrower) |
 | `list_transactions` | Filtered + paginated transaction list (type, date range, keyword, category), each item includes the category name |
 | `get_transaction` | Transaction detail by id, including category name |
 | `delete_transactions` | Delete transactions by ids; returns the number deleted |
 | `update_transaction_category` | Set or clear the category of existing transactions (batch, e.g. categorize old records) |
 | `pay_loan` | Repay a loan you BORROWED — converts the loan into an expense (same logic as the bot's `/pay`) |
+| `export_transactions` | Export transactions to a FILE on disk (CSV with UTF-8 BOM, or XLSX) and return a `[FILE:...]<path>` marker for `sendDocument` |
+| `add_transactions_bulk` | Batch-import transactions in ONE insert (e.g. restoring old records); per-row validation errors returned in the summary |
 | `get_report` | Totals by type + breakdown by category for a date range |
 | `get_balance` | Current balance (income − expense) in VND |
 | `get_user_profile` | User profile `{telegram_user_id, username, timezone, currency}` (master can inspect other users) |
@@ -29,6 +33,11 @@ Amounts are **real VND** (the old bot's x1000 convention is **not** used here �
 | `delete_category` | Delete a category; transactions referencing it become NULL (FK `ON DELETE SET NULL`) |
 
 All tools accept a leading `telegram_user_id` parameter (optional — see [Multi-user support](#multi-user-support)). Every transaction-data tool also accepts `target_telegram_user_id` (see [Master admin](#master-admin)).
+
+**Lending (cho vay):** `lending` is money you LENT to others — a receivable, the
+opposite of `loan` (money you BORROWED). `collect_lending` converts a lending
+into an `income` when the borrower pays you back. Lending is excluded from the
+balance (like LOAN, it is neither income nor expense).
 
 ## Multi-user support
 
