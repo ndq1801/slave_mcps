@@ -2,7 +2,9 @@
 
 Shares the FinlogBot PostgreSQL database. Amounts are real VND (no x1000
 convention used by the old bot). Dates are strings in YYYY-MM-DD format and
-are interpreted as UTC dates.
+are interpreted as the user's LOCAL dates: start-of-day (local) is converted
+to UTC when storing/querying, and end-of-day (local) is converted to UTC for
+the upper bound of a date range. They default to today when omitted.
 
 Every tool returns JSON-serializable data or an "[ERROR] ..." string; tools
 never raise exceptions to the MCP client.
@@ -39,6 +41,21 @@ mcp = FastMCP("mcp-finlog")
 
 UTC = ZoneInfo("UTC")
 
+# Timezone/currency defaults replicated from FinlogBot app/common/enums.py
+# (LanguageLocale): timezone is an IANA name, currency a 3-letter code.
+#   VI -> "Asia/Ho_Chi_Minh"/"VND", JA -> "Asia/Tokyo"/"JPY", EN -> "UTC"/"USD"
+_LANGUAGE_DEFAULT_TIMEZONES = {
+    "vi": "Asia/Ho_Chi_Minh",
+    "ja": "Asia/Tokyo",
+    "en": "UTC",
+}
+_LANGUAGE_DEFAULT_CURRENCIES = {
+    "vi": "VND",
+    "ja": "JPY",
+    "en": "USD",
+}
+_VALID_CURRENCIES = frozenset(_LANGUAGE_DEFAULT_CURRENCIES.values())
+
 
 # ---------------------------------------------------------------------------
 # Startup / helpers
@@ -49,6 +66,30 @@ def _error(message: str) -> str:
     return f"[ERROR] {message}"
 
 
+def _effective_telegram_id(telegram_user_id: int | None) -> int:
+    """Resolve the caller's telegram user id (arg or FINLOG_TELEGRAM_USER_ID)."""
+    if telegram_user_id is not None:
+        return telegram_user_id
+    telegram_id_str = os.environ.get("FINLOG_TELEGRAM_USER_ID", "").strip()
+    if not telegram_id_str:
+        raise ValueError(
+            "Không xác định được user: hãy truyền telegram_user_id hoặc đặt "
+            "FINLOG_TELEGRAM_USER_ID."
+        )
+    return int(telegram_id_str)
+
+
+def _is_master(telegram_user_id: int) -> bool:
+    """True when the caller is the master admin (FINLOG_MASTER_TELEGRAM_ID)."""
+    master_id_str = os.environ.get("FINLOG_MASTER_TELEGRAM_ID", "").strip()
+    if not master_id_str:
+        return False
+    try:
+        return int(master_id_str) == telegram_user_id
+    except ValueError:
+        return False
+
+
 def _resolve_user(telegram_user_id: int | None) -> int:
     """Resolve (find-or-create) the Finlog user for a single tool call.
 
@@ -56,16 +97,7 @@ def _resolve_user(telegram_user_id: int | None) -> int:
     to the FINLOG_TELEGRAM_USER_ID env var. Raises ValueError (converted to an
     "[ERROR] ..." string by the tools) when no user can be identified.
     """
-    if telegram_user_id is None:
-        telegram_id_str = os.environ.get("FINLOG_TELEGRAM_USER_ID", "").strip()
-        if not telegram_id_str:
-            raise ValueError(
-                "Không xác định được user: hãy truyền telegram_user_id hoặc đặt "
-                "FINLOG_TELEGRAM_USER_ID."
-            )
-        telegram_id = int(telegram_id_str)
-    else:
-        telegram_id = telegram_user_id
+    telegram_id = _effective_telegram_id(telegram_user_id)
 
     session = get_session_factory()()
     try:
@@ -79,6 +111,7 @@ def _resolve_user(telegram_user_id: int | None) -> int:
                         telegram_user_id=telegram_id,
                         username="mcp",
                         first_name="MCP",
+                        last_name=None,
                     )
                 )
             except IntegrityError:
@@ -92,6 +125,28 @@ def _resolve_user(telegram_user_id: int | None) -> int:
         session.close()
 
 
+def _resolve_target(
+    telegram_user_id: int | None, target_telegram_user_id: int | None
+) -> int:
+    """Resolve the user whose data a tool operates on.
+
+    telegram_user_id is the CALLER (used for authorization); when
+    target_telegram_user_id is omitted it defaults to the caller's own data.
+    Operating on another user's data is only allowed when the caller is the
+    master admin (FINLOG_MASTER_TELEGRAM_ID). Raises ValueError (converted to
+    an "[ERROR] ..." string by the tools) when access is denied.
+    """
+    caller_user_id = _resolve_user(telegram_user_id)
+    caller_telegram_id = _effective_telegram_id(telegram_user_id)
+    if target_telegram_user_id is None:
+        return caller_user_id
+    if target_telegram_user_id == caller_telegram_id:
+        return caller_user_id
+    if not _is_master(caller_telegram_id):
+        raise ValueError("Bạn không có quyền truy cập dữ liệu của user khác.")
+    return _resolve_user(target_telegram_user_id)
+
+
 @contextmanager
 def _session_scope():
     session = get_session_factory()()
@@ -101,12 +156,71 @@ def _session_scope():
         session.close()
 
 
-def _parse_date(value: Optional[str]) -> datetime:
-    """Parse YYYY-MM-DD as a UTC datetime; defaults to now when empty."""
+def _load_user(session, user_id: int) -> Optional[User]:
+    """Load a User entity by internal user id within the given session."""
+    return SqlAlchemyUserRepository(session).get_by_id(user_id)
+
+
+def _default_timezone_for(language_code: Optional[str]) -> str:
+    """Replicate FinlogBot's LanguageLocale.default_timezone fallback.
+
+    Uses the user's language default when no explicit timezone is stored;
+    falls back to "UTC" when the language is unknown or absent.
+    """
+    if language_code:
+        return _LANGUAGE_DEFAULT_TIMEZONES.get(language_code.lower(), "UTC")
+    return "UTC"
+
+
+def _zone_info_for(user: User) -> ZoneInfo:
+    """Resolve a user's timezone (column users.timezone) to a ZoneInfo.
+
+    Format replicates FinlogBot: IANA name such as "Asia/Ho_Chi_Minh".
+    Falls back to "UTC" when unset or invalid.
+    """
+    tz_name = user.timezone or _default_timezone_for(user.language_code)
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return UTC
+
+
+def _user_timezone(user_id: int) -> ZoneInfo:
+    """Return the ZoneInfo for a user (column users.timezone); fallback UTC."""
+    with _session_scope() as session:
+        user = _load_user(session, user_id)
+        return _zone_info_for(user) if user else UTC
+
+
+def _parse_date(value: Optional[str], tz: ZoneInfo) -> datetime:
+    """Parse YYYY-MM-DD as a UTC datetime.
+
+    The given date is the user's LOCAL date: local start-of-day is converted
+    to UTC. Defaults to now (UTC) when empty.
+    """
     if value is None or not value.strip():
         return datetime.now(UTC)
     try:
-        return datetime.strptime(value.strip(), "%Y-%m-%d").replace(tzinfo=UTC)
+        local = datetime.strptime(value.strip(), "%Y-%m-%d").replace(tzinfo=tz)
+        return local.astimezone(UTC)
+    except ValueError:
+        raise ValueError(
+            f"Invalid date format: {value!r}. Expected YYYY-MM-DD."
+        )
+
+
+def _parse_date_end(value: Optional[str], tz: ZoneInfo) -> datetime:
+    """Parse YYYY-MM-DD as a UTC datetime at the end of the user's local day.
+
+    Used for the upper bound (to) of date-range queries.
+    """
+    if value is None or not value.strip():
+        return datetime.now(UTC)
+    try:
+        local = datetime.strptime(value.strip(), "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=tz
+        )
+        return local.astimezone(UTC)
     except ValueError:
         raise ValueError(
             f"Invalid date format: {value!r}. Expected YYYY-MM-DD."
@@ -134,25 +248,39 @@ def _load_category_names(session) -> Dict[int, str]:
 def _tx_to_dict(
     tx: Transaction,
     category_names: Optional[Dict[int, str]] = None,
+    tz: Optional[ZoneInfo] = None,
+    currency: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Serialize a Transaction entity to a JSON-serializable dict."""
+    """Serialize a Transaction entity to a JSON-serializable dict.
+
+    transaction_date / created_at / updated_at are returned in the owner
+    user's local timezone (tz); falls back to UTC when tz is None.
+    """
+    local_tz = tz or UTC
+
+    def _to_local(value: Optional[datetime]) -> Optional[str]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(local_tz).isoformat()
+
     return {
         "id": tx.id,
         "user_id": tx.user_id,
         "type": tx.type.value if isinstance(tx.type, TransactionType) else str(tx.type),
         "amount": float(tx.amount),
         "description": tx.description,
-        "transaction_date": tx.transaction_date.isoformat()
-        if tx.transaction_date
-        else None,
+        "transaction_date": _to_local(tx.transaction_date),
         "category_id": tx.category_id,
         "category_name": (
             category_names.get(tx.category_id)
             if category_names and tx.category_id
             else None
         ),
-        "created_at": tx.created_at.isoformat() if tx.created_at else None,
-        "updated_at": tx.updated_at.isoformat() if tx.updated_at else None,
+        "created_at": _to_local(tx.created_at),
+        "updated_at": _to_local(tx.updated_at),
+        "currency": currency,
     }
 
 
@@ -168,21 +296,33 @@ def _category_to_dict(category: CategoryModel) -> Dict[str, Any]:
 def add_expense(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
     category_id: Optional[int] = None,
     date: Optional[str] = None,
 ) -> Any:
-    """Record an expense. Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today.
+    """Record an expense. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         if amount <= 0:
             return _error("Amount must be greater than 0.")
-        transaction_date = _parse_date(date)
         with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            if not user.currency:
+                return _error(
+                    "User chưa cấu hình currency (đơn vị tiền tệ). Hãy hỏi user "
+                    "muốn dùng đơn vị nào (VD: VND, USD, JPY) rồi gọi "
+                    "update_user_settings để thiết lập trước khi ghi giao dịch."
+                )
+            tz = _zone_info_for(user)
+            transaction_date = _parse_date(date, tz)
             category_repo = SqlAlchemyCategoryRepository(session)
             if category_id is not None and category_repo.get_by_id(category_id) is None:
                 return _error(f"Category {category_id} does not exist.")
@@ -200,7 +340,9 @@ def add_expense(
                     category_id=category_id,
                 )
             )
-            return _tx_to_dict(tx, _load_category_names(session))
+            return _tx_to_dict(
+                tx, _load_category_names(session), tz=tz, currency=user.currency
+            )
     except Exception as exc:
         return _error(str(exc))
 
@@ -209,21 +351,33 @@ def add_expense(
 def add_income(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
     category_id: Optional[int] = None,
     date: Optional[str] = None,
 ) -> Any:
-    """Record an income. Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today.
+    """Record an income. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         if amount <= 0:
             return _error("Amount must be greater than 0.")
-        transaction_date = _parse_date(date)
         with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            if not user.currency:
+                return _error(
+                    "User chưa cấu hình currency (đơn vị tiền tệ). Hãy hỏi user "
+                    "muốn dùng đơn vị nào (VD: VND, USD, JPY) rồi gọi "
+                    "update_user_settings để thiết lập trước khi ghi giao dịch."
+                )
+            tz = _zone_info_for(user)
+            transaction_date = _parse_date(date, tz)
             category_repo = SqlAlchemyCategoryRepository(session)
             if category_id is not None and category_repo.get_by_id(category_id) is None:
                 return _error(f"Category {category_id} does not exist.")
@@ -241,7 +395,9 @@ def add_income(
                     category_id=category_id,
                 )
             )
-            return _tx_to_dict(tx, _load_category_names(session))
+            return _tx_to_dict(
+                tx, _load_category_names(session), tz=tz, currency=user.currency
+            )
     except Exception as exc:
         return _error(str(exc))
 
@@ -250,20 +406,32 @@ def add_income(
 def add_loan(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
     date: Optional[str] = None,
 ) -> Any:
-    """Record a loan (no category). Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today.
+    """Record a loan (no category). Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         if amount <= 0:
             return _error("Amount must be greater than 0.")
-        transaction_date = _parse_date(date)
         with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            if not user.currency:
+                return _error(
+                    "User chưa cấu hình currency (đơn vị tiền tệ). Hãy hỏi user "
+                    "muốn dùng đơn vị nào (VD: VND, USD, JPY) rồi gọi "
+                    "update_user_settings để thiết lập trước khi ghi giao dịch."
+                )
+            tz = _zone_info_for(user)
+            transaction_date = _parse_date(date, tz)
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.create(
                 Transaction(
@@ -278,7 +446,9 @@ def add_loan(
                     category_id=None,
                 )
             )
-            return _tx_to_dict(tx, _load_category_names(session))
+            return _tx_to_dict(
+                tx, _load_category_names(session), tz=tz, currency=user.currency
+            )
     except Exception as exc:
         return _error(str(exc))
 
@@ -287,6 +457,7 @@ def add_loan(
 def list_transactions(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     type: Optional[str] = None,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
@@ -295,22 +466,34 @@ def list_transactions(
     page: int = 1,
     page_size: int = 20,
 ) -> Any:
-    """List transactions with filters (type, date range YYYY-MM-DD, keyword, category) and pagination. Amounts are real VND.
+    """List transactions with filters (type, date range YYYY-MM-DD local, keyword, category) and pagination. Amounts are real VND.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         if page < 1:
             return _error("page must be >= 1.")
         if page_size < 1:
             return _error("page_size must be >= 1.")
-        start = _parse_date(from_date) if from_date else datetime(2000, 1, 1, tzinfo=UTC)
-        end = _parse_date(to_date) if to_date else datetime(2100, 1, 1, tzinfo=UTC)
-        end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
         transaction_types = [_parse_type(type)] if type else None
         skip = (page - 1) * page_size
         with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            tz = _zone_info_for(user)
+            start = (
+                _parse_date(from_date, tz)
+                if from_date
+                else datetime(2000, 1, 1, tzinfo=UTC)
+            )
+            end = (
+                _parse_date_end(to_date, tz)
+                if to_date
+                else datetime(2100, 1, 1, tzinfo=UTC)
+            )
             repo = SqlAlchemyTransactionRepository(session)
             transactions, total = repo.get_by_user_and_date_range_with_filters(
                 user_id,
@@ -327,7 +510,11 @@ def list_transactions(
                 "total": total,
                 "page": page,
                 "page_size": page_size,
-                "items": [_tx_to_dict(tx, category_names) for tx in transactions],
+                "currency": user.currency,
+                "items": [
+                    _tx_to_dict(tx, category_names, tz=tz, currency=user.currency)
+                    for tx in transactions
+                ],
             }
     except Exception as exc:
         return _error(str(exc))
@@ -337,20 +524,27 @@ def list_transactions(
 def get_transaction(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     transaction_id: int,
 ) -> Any:
     """Get transaction details by id (including category name). Amount is real VND.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.get_by_id(transaction_id)
             if tx is None or tx.user_id != user_id:
                 return _error(f"Transaction {transaction_id} not found.")
-            return _tx_to_dict(tx, _load_category_names(session))
+            user = _load_user(session, tx.user_id)
+            tz = _zone_info_for(user) if user else UTC
+            currency = user.currency if user else None
+            return _tx_to_dict(
+                tx, _load_category_names(session), tz=tz, currency=currency
+            )
     except Exception as exc:
         return _error(str(exc))
 
@@ -359,14 +553,16 @@ def get_transaction(
 def delete_transactions(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     transaction_ids: list[int],
 ) -> Any:
     """Delete transactions by ids; returns the number of transactions deleted.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             transactions = repo.get_by_ids(transaction_ids)
@@ -378,21 +574,60 @@ def delete_transactions(
 
 
 @mcp.tool()
+def update_transaction_category(
+    *,
+    telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
+    transaction_ids: list[int],
+    category_id: Optional[int] = None,
+) -> Any:
+    """Set or clear the category of existing transactions (batch, e.g. categorize old records). Pass category_id=None to clear it.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        with _session_scope() as session:
+            if category_id is not None:
+                category_repo = SqlAlchemyCategoryRepository(session)
+                if category_repo.get_by_id(category_id) is None:
+                    return _error(f"Category {category_id} does not exist.")
+            repo = SqlAlchemyTransactionRepository(session)
+            transactions = repo.get_by_ids(transaction_ids)
+            own_ids = [tx.id for tx in transactions if tx.user_id == user_id]
+            if not own_ids:
+                return _error("No transactions found for this user.")
+            updated = repo.update_many(
+                own_ids,
+                {
+                    "category_id": category_id,
+                    "updated_at": datetime.now(UTC),
+                },
+            )
+            return {"updated": updated}
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
 def pay_loan(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     loan_id: int,
 ) -> Any:
     """Pay a loan: convert a loan transaction into an expense. Amount is real VND.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.get_by_id(loan_id)
-            if tx is None:
+            if tx is None or tx.user_id != user_id:
                 return _error(f"Transaction {loan_id} not found.")
             if tx.type != TransactionType.LOAN:
                 return _error(f"Transaction {loan_id} is not a loan; only loans can be paid.")
@@ -406,7 +641,12 @@ def pay_loan(
             if updated != 1:
                 return _error(f"Failed to convert transaction {loan_id}.")
             paid = repo.get_by_id(loan_id)
-            return _tx_to_dict(paid, _load_category_names(session))
+            user = _load_user(session, user_id)
+            tz = _zone_info_for(user) if user else UTC
+            currency = user.currency if user else None
+            return _tx_to_dict(
+                paid, _load_category_names(session), tz=tz, currency=currency
+            )
     except Exception as exc:
         return _error(str(exc))
 
@@ -415,22 +655,26 @@ def pay_loan(
 def get_report(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
     from_date: str,
     to_date: str,
     type: Optional[str] = None,
 ) -> Any:
-    """Report totals by type plus breakdown by category for a date range (YYYY-MM-DD). Amounts are real VND.
+    """Report totals by type plus breakdown by category for a date range (YYYY-MM-DD local). Amounts are real VND.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
-        start = _parse_date(from_date)
-        end = _parse_date(to_date).replace(
-            hour=23, minute=59, second=59, microsecond=999999
-        )
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         transaction_type = _parse_type(type)
         with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            tz = _zone_info_for(user)
+            start = _parse_date(from_date, tz)
+            end = _parse_date_end(to_date, tz)
             repo = SqlAlchemyTransactionRepository(session)
             totals = repo.get_summary_by_type_and_date_range(user_id, start, end)
             by_category = []
@@ -450,6 +694,7 @@ def get_report(
             return {
                 "from_date": from_date,
                 "to_date": to_date,
+                "currency": user.currency,
                 "totals": totals,
                 "by_category": by_category,
             }
@@ -461,16 +706,104 @@ def get_report(
 def get_balance(
     *,
     telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
 ) -> Any:
-    """Current balance (total income minus total expense) in real VND.
+    """Current balance (total income minus total expense) in the user's currency.
 
-    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user sở hữu dữ liệu; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
     """
     try:
-        user_id = _resolve_user(telegram_user_id)
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
         with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
             repo = SqlAlchemyTransactionRepository(session)
-            return repo.get_user_balance(user_id)
+            result = repo.get_user_balance(user_id)
+            result["currency"] = user.currency
+            return result
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_user_profile(
+    *,
+    telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
+) -> Any:
+    """Return a user's profile (telegram_user_id, username, timezone, currency). Master can inspect other users via target_telegram_user_id.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user cần xem; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        with _session_scope() as session:
+            user = _load_user(session, user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            return {
+                "telegram_user_id": user.telegram_user_id,
+                "username": user.username,
+                "timezone": user.timezone,
+                "currency": user.currency,
+            }
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def update_user_settings(
+    *,
+    telegram_user_id: int | None = None,
+    target_telegram_user_id: int | None = None,
+    timezone: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> Any:
+    """Update a user's timezone and/or currency. At least one of timezone/currency is required. Master can update other users via target_telegram_user_id.
+
+    telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user cần cập nhật; mặc định = telegram_user_id; chỉ master (FINLOG_MASTER_TELEGRAM_ID) được truy cập user khác.
+    """
+    try:
+        user_id = _resolve_target(telegram_user_id, target_telegram_user_id)
+        if timezone is None and currency is None:
+            return _error("Phải truyền ít nhất một trong: timezone hoặc currency.")
+        if timezone is not None:
+            timezone = timezone.strip()
+            try:
+                ZoneInfo(timezone)
+            except Exception:
+                return _error(
+                    f"Invalid timezone: {timezone!r}. Use an IANA zone name "
+                    "(VD: Asia/Ho_Chi_Minh, UTC)."
+                )
+        if currency is not None:
+            currency = currency.strip().upper()
+            if currency not in _VALID_CURRENCIES:
+                return _error(
+                    f"Invalid currency: {currency!r}. Supported currencies: "
+                    f"{', '.join(sorted(_VALID_CURRENCIES))}."
+                )
+        with _session_scope() as session:
+            repo = SqlAlchemyUserRepository(session)
+            user = repo.get_by_id(user_id)
+            if user is None:
+                return _error(f"User {user_id} not found.")
+            if timezone is not None:
+                user.timezone = timezone
+            if currency is not None:
+                user.currency = currency
+            user.updated_at = datetime.now(UTC)
+            updated = repo.update(user)
+            return {
+                "telegram_user_id": updated.telegram_user_id,
+                "username": updated.username,
+                "timezone": updated.timezone,
+                "currency": updated.currency,
+            }
     except Exception as exc:
         return _error(str(exc))
 
