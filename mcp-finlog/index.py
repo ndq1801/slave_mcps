@@ -809,6 +809,171 @@ def update_user_settings(
 
 
 @mcp.tool()
+def search_users(
+    *,
+    telegram_user_id: int | None = None,
+    query: str,
+    limit: int = 20,
+) -> Any:
+    """[master only] Search users by telegram id (exact) or by username/first_name/last_name (substring). Returns [{telegram_user_id, username, first_name, last_name, timezone, currency}].
+
+    telegram_user_id: Telegram user id của master; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
+    try:
+        if not _is_master(_effective_telegram_id(telegram_user_id)):
+            return _error("Chỉ master admin mới được dùng chức năng này.")
+        limit = max(1, min(limit, 100))
+        with _session_scope() as session:
+            repo = SqlAlchemyUserRepository(session)
+            return [
+                {
+                    "telegram_user_id": user.telegram_user_id,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "timezone": user.timezone,
+                    "currency": user.currency,
+                }
+                for user in repo.search(query, limit=limit)
+            ]
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def update_user(
+    *,
+    telegram_user_id: int | None = None,
+    target_telegram_user_id: int,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    language_code: Optional[str] = None,
+    timezone: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> Any:
+    """[master only] Update a user's profile fields (username/first_name/last_name/language_code/timezone/currency). At least one field is required. An empty timezone/currency clears that value.
+
+    telegram_user_id: Telegram user id của master; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user cần cập nhật.
+    """
+    try:
+        if not _is_master(_effective_telegram_id(telegram_user_id)):
+            return _error("Chỉ master admin mới được dùng chức năng này.")
+        if all(
+            value is None
+            for value in (
+                username,
+                first_name,
+                last_name,
+                language_code,
+                timezone,
+                currency,
+            )
+        ):
+            return _error("Phải cung cấp ít nhất một trường để cập nhật.")
+        updates: Dict[str, Any] = {}
+        if username is not None:
+            updates["username"] = username.strip()
+        if first_name is not None:
+            updates["first_name"] = first_name.strip()
+        if last_name is not None:
+            updates["last_name"] = last_name.strip()
+        if language_code is not None:
+            updates["language_code"] = language_code.strip()
+        if timezone is not None:
+            tz_value = timezone.strip()
+            if tz_value:
+                try:
+                    ZoneInfo(tz_value)
+                except Exception:
+                    return _error(
+                        f"Invalid timezone: {tz_value!r}. Use an IANA zone name "
+                        "(VD: Asia/Ho_Chi_Minh, UTC)."
+                    )
+                updates["timezone"] = tz_value
+            else:
+                updates["timezone"] = None
+        if currency is not None:
+            currency_value = currency.strip().upper()
+            if currency_value:
+                if currency_value not in _VALID_CURRENCIES:
+                    return _error(
+                        f"Invalid currency: {currency_value!r}. Supported currencies: "
+                        f"{', '.join(sorted(_VALID_CURRENCIES))}."
+                    )
+                updates["currency"] = currency_value
+            else:
+                updates["currency"] = None
+        with _session_scope() as session:
+            repo = SqlAlchemyUserRepository(session)
+            user = repo.get_by_telegram_id(target_telegram_user_id)
+            if user is None:
+                return _error(f"User {target_telegram_user_id} không tồn tại.")
+            for field, value in updates.items():
+                setattr(user, field, value)
+            user.updated_at = datetime.now(UTC)
+            updated = repo.update(user)
+            return {
+                "telegram_user_id": updated.telegram_user_id,
+                "username": updated.username,
+                "timezone": updated.timezone,
+                "currency": updated.currency,
+            }
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def delete_user(
+    *,
+    telegram_user_id: int | None = None,
+    target_telegram_user_id: int,
+) -> Any:
+    """[master only] Delete a user and all their transactions. Cannot delete yourself or the master account.
+
+    telegram_user_id: Telegram user id của master; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    target_telegram_user_id: Telegram user id của user cần xoá.
+    """
+    try:
+        caller_telegram_id = _effective_telegram_id(telegram_user_id)
+        if not _is_master(caller_telegram_id):
+            return _error("Chỉ master admin mới được dùng chức năng này.")
+        if target_telegram_user_id == caller_telegram_id:
+            return _error("Không thể xoá chính mình.")
+        master_id_str = os.environ.get("FINLOG_MASTER_TELEGRAM_ID", "").strip()
+        try:
+            master_id = int(master_id_str) if master_id_str else None
+        except ValueError:
+            master_id = None
+        if master_id is not None and target_telegram_user_id == master_id:
+            return _error("Không thể xoá master admin.")
+        with _session_scope() as session:
+            repo = SqlAlchemyUserRepository(session)
+            user = repo.get_by_telegram_id(target_telegram_user_id)
+            if user is None:
+                return _error(f"User {target_telegram_user_id} không tồn tại.")
+            tx_repo = SqlAlchemyTransactionRepository(session)
+            transaction_ids: List[int] = []
+            skip = 0
+            while True:
+                page = tx_repo.get_by_user_id(user.id, skip=skip, limit=100)
+                if not page:
+                    break
+                transaction_ids.extend(tx.id for tx in page)
+                skip += len(page)
+            transactions_deleted = tx_repo.delete_many(transaction_ids)
+            repo.delete(user.id)
+            return {
+                "deleted": True,
+                "telegram_user_id": target_telegram_user_id,
+                "transactions_deleted": transactions_deleted,
+            }
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
 def list_categories(
     *,
     telegram_user_id: int | None = None,

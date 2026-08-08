@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.domain.user.entities import User
@@ -74,6 +75,40 @@ class SqlAlchemyUserRepository(UserRepository):
             .limit(limit)
             .all()
         )
+        return [self._to_entity(model) for model in models]
+
+    def search(self, query: str, limit: int = 20) -> List[User]:
+        """Search users by telegram id (exact match) or by
+        username/first_name/last_name (case-insensitive substring).
+
+        A query that parses as an integer matches the telegram_user_id column
+        exactly; otherwise username/first_name/last_name are matched with
+        ILIKE %query%. Results are ordered by user id.
+        """
+        search_text = query.strip()
+        if search_text.isdigit():
+            models = (
+                self.session.query(UserModel)
+                .filter(UserModel.telegram_user_id == int(search_text))
+                .order_by(UserModel.id)
+                .limit(limit)
+                .all()
+            )
+        else:
+            pattern = f"%{search_text}%"
+            models = (
+                self.session.query(UserModel)
+                .filter(
+                    or_(
+                        UserModel.username.ilike(pattern),
+                        UserModel.first_name.ilike(pattern),
+                        UserModel.last_name.ilike(pattern),
+                    )
+                )
+                .order_by(UserModel.id)
+                .limit(limit)
+                .all()
+            )
         return [self._to_entity(model) for model in models]
 
     @staticmethod

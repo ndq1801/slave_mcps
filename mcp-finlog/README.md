@@ -20,6 +20,9 @@ Amounts are **real VND** (the old bot's x1000 convention is **not** used here �
 | `get_balance` | Current balance (income − expense) in VND |
 | `get_user_profile` | User profile `{telegram_user_id, username, timezone, currency}` (master can inspect other users) |
 | `update_user_settings` | Set a user's `timezone` and/or `currency` (validates the values; master can update other users) |
+| `search_users` | **master only** — search users by telegram id (exact) or by name substring; returns `{telegram_user_id, username, first_name, last_name, timezone, currency}` |
+| `update_user` | **master only** — update a user's profile fields (`username`, `first_name`, `last_name`, `language_code`, `timezone`, `currency`); validates timezone/currency; an empty `timezone`/`currency` clears that value |
+| `delete_user` | **master only** — delete a user **and all their transactions** (same session); refuses to delete yourself or the master account |
 | `list_categories` | List all categories `[{id, name}]`, sorted by id |
 | `add_category` | Create a category (name must be unique) |
 | `update_category` | Rename a category (no collision with another category) |
@@ -73,6 +76,15 @@ nobody can access another user's data.
   `update_transaction_category` on behalf of any user.
 - The master can also call `get_user_profile` / `update_user_settings` with
   `target_telegram_user_id` to inspect or update another user's timezone/currency.
+- The user-management tools `search_users`, `update_user` and `delete_user` are
+  **master only**: a non-master caller gets
+  `[ERROR] Chỉ master admin mới được dùng chức năng này.` `update_user` requires
+  at least one field (`Phải cung cấp ít nhất một trường để cập nhật.`) and
+  validates timezone (`ZoneInfo`) and currency (`VND`/`JPY`/`USD`); an empty
+  timezone/currency clears that value. `delete_user` removes the user **and all
+  their transactions** in the same session, and guards against deleting the
+  caller (`Không thể xoá chính mình.`) or the master account
+  (`Không thể xoá master admin.`).
 - A non-master caller passing `target_telegram_user_id` for another user gets:
   `[ERROR] Bạn không có quyền truy cập dữ liệu của user khác.`
 
