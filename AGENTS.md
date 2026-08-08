@@ -7,7 +7,7 @@ alwaysApply: true
 
 ## Project overview
 
-`mcp-hub` is a collection of self-contained MCP stdio servers (Node.js, `@modelcontextprotocol/sdk`). One folder per server (`mcp-daily-report/`, ...). Each server keeps its credentials in its own `.env` (gitignored) or receives them from the host process environment.
+`mcp-hub` is a collection of self-contained MCP stdio servers (Node.js or Python). One folder per server (`mcp-daily-report/`, `mcp-finlog/`, ...). Each server keeps its credentials in its own `.env` (gitignored) or receives them from the host process environment.
 
 ## Coding rules
 
@@ -26,10 +26,11 @@ alwaysApply: true
 5. **Host-scope guard**: `httpFetch` must refuse requests to hosts other than the configured app host.
 6. Every new server must ship with `README.md` (description, tool list, env table, client config example) and `.env.example`.
 7. Write operations that mutate app data should be serialized (one at a time) to keep verification and flash messages unambiguous.
+8. **Multi-user identity convention**: servers that manage per-user data must accept `telegram_user_id: int | None = None` as the first parameter of every tool. Resolve the user per call (find-or-create by telegram id, like `mcp-finlog`); when the parameter is omitted, fall back to a dedicated env var (e.g. `FINLOG_TELEGRAM_USER_ID`). Never ask the model for credentials (see rule 4) — identity always comes from the host (assistant-bot) or the env fallback.
 
 ## Verification
 
-- Per server: `npm install` then spawn it via an MCP client or `assistant-bot`'s `smoke_test.py` (spawn + login + clean shutdown).
+- Per server: `npm install` (or `pip install -r requirements.txt` for Python servers) then spawn it via an MCP client or `assistant-bot`'s `smoke_test.py` (spawn + login + clean shutdown).
 - Before finishing a change, run the smoke test of every server you touched.
 
 ## Secrets

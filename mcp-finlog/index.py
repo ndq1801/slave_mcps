@@ -39,8 +39,6 @@ mcp = FastMCP("mcp-finlog")
 
 UTC = ZoneInfo("UTC")
 
-_user_id: Optional[int] = None
-
 
 # ---------------------------------------------------------------------------
 # Startup / helpers
@@ -51,40 +49,23 @@ def _error(message: str) -> str:
     return f"[ERROR] {message}"
 
 
-def _resolve_user_id() -> int:
-    """Validate env config and resolve (creating if needed) the Finlog user.
+def _resolve_user(telegram_user_id: int | None) -> int:
+    """Resolve (find-or-create) the Finlog user for a single tool call.
 
-    Called at server startup (before mcp.run). Exits with a clear stderr
-    message when DATABASE_URL / FINLOG_TELEGRAM_USER_ID are missing.
+    Uses the caller-provided telegram_user_id when given; otherwise falls back
+    to the FINLOG_TELEGRAM_USER_ID env var. Raises ValueError (converted to an
+    "[ERROR] ..." string by the tools) when no user can be identified.
     """
-    global _user_id
-
-    if not settings.database_url:
-        print(
-            "[ERROR] DATABASE_URL is not set. Add it to the environment or to "
-            "mcp-finlog/.env before starting the server.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    telegram_id_str = os.environ.get("FINLOG_TELEGRAM_USER_ID", "").strip()
-    if not telegram_id_str:
-        print(
-            "[ERROR] FINLOG_TELEGRAM_USER_ID is not set. Add it to the "
-            "environment or to mcp-finlog/.env before starting the server.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    try:
+    if telegram_user_id is None:
+        telegram_id_str = os.environ.get("FINLOG_TELEGRAM_USER_ID", "").strip()
+        if not telegram_id_str:
+            raise ValueError(
+                "Không xác định được user: hãy truyền telegram_user_id hoặc đặt "
+                "FINLOG_TELEGRAM_USER_ID."
+            )
         telegram_id = int(telegram_id_str)
-    except ValueError:
-        print(
-            f"[ERROR] FINLOG_TELEGRAM_USER_ID must be an integer, got: "
-            f"{telegram_id_str!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    else:
+        telegram_id = telegram_user_id
 
     session = get_session_factory()()
     try:
@@ -106,17 +87,9 @@ def _resolve_user_id() -> int:
                 user = user_repo.get_by_telegram_id(telegram_id)
                 if user is None:
                     raise
-        _user_id = user.id
-        return _user_id
+        return user.id
     finally:
         session.close()
-
-
-def _ensure_user_id() -> int:
-    """Return the resolved user id, resolving lazily if startup was skipped."""
-    if _user_id is None:
-        return _resolve_user_id()
-    return _user_id
 
 
 @contextmanager
@@ -193,14 +166,19 @@ def _category_to_dict(category: CategoryModel) -> Dict[str, Any]:
 
 @mcp.tool()
 def add_expense(
+    *,
+    telegram_user_id: int | None = None,
     amount: float,
     description: str,
     category_id: Optional[int] = None,
     date: Optional[str] = None,
 ) -> Any:
-    """Record an expense. Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today."""
+    """Record an expense. Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         if amount <= 0:
             return _error("Amount must be greater than 0.")
         transaction_date = _parse_date(date)
@@ -229,14 +207,19 @@ def add_expense(
 
 @mcp.tool()
 def add_income(
+    *,
+    telegram_user_id: int | None = None,
     amount: float,
     description: str,
     category_id: Optional[int] = None,
     date: Optional[str] = None,
 ) -> Any:
-    """Record an income. Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today."""
+    """Record an income. Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         if amount <= 0:
             return _error("Amount must be greater than 0.")
         transaction_date = _parse_date(date)
@@ -265,13 +248,18 @@ def add_income(
 
 @mcp.tool()
 def add_loan(
+    *,
+    telegram_user_id: int | None = None,
     amount: float,
     description: str,
     date: Optional[str] = None,
 ) -> Any:
-    """Record a loan (no category). Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today."""
+    """Record a loan (no category). Amount is real VND (not x1000). Date is YYYY-MM-DD, defaults to today.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         if amount <= 0:
             return _error("Amount must be greater than 0.")
         transaction_date = _parse_date(date)
@@ -297,6 +285,8 @@ def add_loan(
 
 @mcp.tool()
 def list_transactions(
+    *,
+    telegram_user_id: int | None = None,
     type: Optional[str] = None,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
@@ -305,9 +295,12 @@ def list_transactions(
     page: int = 1,
     page_size: int = 20,
 ) -> Any:
-    """List transactions with filters (type, date range YYYY-MM-DD, keyword, category) and pagination. Amounts are real VND."""
+    """List transactions with filters (type, date range YYYY-MM-DD, keyword, category) and pagination. Amounts are real VND.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         if page < 1:
             return _error("page must be >= 1.")
         if page_size < 1:
@@ -341,10 +334,17 @@ def list_transactions(
 
 
 @mcp.tool()
-def get_transaction(transaction_id: int) -> Any:
-    """Get transaction details by id (including category name). Amount is real VND."""
+def get_transaction(
+    *,
+    telegram_user_id: int | None = None,
+    transaction_id: int,
+) -> Any:
+    """Get transaction details by id (including category name). Amount is real VND.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.get_by_id(transaction_id)
@@ -356,10 +356,17 @@ def get_transaction(transaction_id: int) -> Any:
 
 
 @mcp.tool()
-def delete_transactions(transaction_ids: list[int]) -> Any:
-    """Delete transactions by ids; returns the number of transactions deleted."""
+def delete_transactions(
+    *,
+    telegram_user_id: int | None = None,
+    transaction_ids: list[int],
+) -> Any:
+    """Delete transactions by ids; returns the number of transactions deleted.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             transactions = repo.get_by_ids(transaction_ids)
@@ -371,10 +378,17 @@ def delete_transactions(transaction_ids: list[int]) -> Any:
 
 
 @mcp.tool()
-def pay_loan(loan_id: int) -> Any:
-    """Pay a loan: convert a loan transaction into an expense. Amount is real VND."""
+def pay_loan(
+    *,
+    telegram_user_id: int | None = None,
+    loan_id: int,
+) -> Any:
+    """Pay a loan: convert a loan transaction into an expense. Amount is real VND.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.get_by_id(loan_id)
@@ -399,13 +413,18 @@ def pay_loan(loan_id: int) -> Any:
 
 @mcp.tool()
 def get_report(
+    *,
+    telegram_user_id: int | None = None,
     from_date: str,
     to_date: str,
     type: Optional[str] = None,
 ) -> Any:
-    """Report totals by type plus breakdown by category for a date range (YYYY-MM-DD). Amounts are real VND."""
+    """Report totals by type plus breakdown by category for a date range (YYYY-MM-DD). Amounts are real VND.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         start = _parse_date(from_date)
         end = _parse_date(to_date).replace(
             hour=23, minute=59, second=59, microsecond=999999
@@ -439,10 +458,16 @@ def get_report(
 
 
 @mcp.tool()
-def get_balance() -> Any:
-    """Current balance (total income minus total expense) in real VND."""
+def get_balance(
+    *,
+    telegram_user_id: int | None = None,
+) -> Any:
+    """Current balance (total income minus total expense) in real VND.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        user_id = _ensure_user_id()
+        user_id = _resolve_user(telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyTransactionRepository(session)
             return repo.get_user_balance(user_id)
@@ -451,10 +476,16 @@ def get_balance() -> Any:
 
 
 @mcp.tool()
-def list_categories() -> Any:
-    """List all categories, sorted by id. Returns [{id, name}]."""
+def list_categories(
+    *,
+    telegram_user_id: int | None = None,
+) -> Any:
+    """List all categories, sorted by id. Returns [{id, name}].
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        _ensure_user_id()
+        _resolve_user(telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyCategoryRepository(session)
             return [_category_to_dict(c) for c in repo.list_all()]
@@ -463,10 +494,17 @@ def list_categories() -> Any:
 
 
 @mcp.tool()
-def add_category(name: str) -> Any:
-    """Create a new category. The name must be unique."""
+def add_category(
+    *,
+    telegram_user_id: int | None = None,
+    name: str,
+) -> Any:
+    """Create a new category. The name must be unique.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        _ensure_user_id()
+        _resolve_user(telegram_user_id)
         name = name.strip()
         if not name:
             return _error("Category name must not be empty.")
@@ -484,10 +522,18 @@ def add_category(name: str) -> Any:
 
 
 @mcp.tool()
-def update_category(category_id: int, name: str) -> Any:
-    """Rename a category. The new name must not collide with another category."""
+def update_category(
+    *,
+    telegram_user_id: int | None = None,
+    category_id: int,
+    name: str,
+) -> Any:
+    """Rename a category. The new name must not collide with another category.
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        _ensure_user_id()
+        _resolve_user(telegram_user_id)
         name = name.strip()
         if not name:
             return _error("Category name must not be empty.")
@@ -506,10 +552,17 @@ def update_category(category_id: int, name: str) -> Any:
 
 
 @mcp.tool()
-def delete_category(category_id: int) -> Any:
-    """Delete a category. Transactions referencing it become NULL (FK ON DELETE SET NULL)."""
+def delete_category(
+    *,
+    telegram_user_id: int | None = None,
+    category_id: int,
+) -> Any:
+    """Delete a category. Transactions referencing it become NULL (FK ON DELETE SET NULL).
+
+    telegram_user_id: Telegram user id của người dùng; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
+    """
     try:
-        _ensure_user_id()
+        _resolve_user(telegram_user_id)
         with _session_scope() as session:
             repo = SqlAlchemyCategoryRepository(session)
             if repo.get_by_id(category_id) is None:
@@ -521,5 +574,11 @@ def delete_category(category_id: int) -> Any:
 
 
 if __name__ == "__main__":
-    _resolve_user_id()  # validates env config and ensures the Finlog user exists
+    if not settings.database_url:
+        print(
+            "[ERROR] DATABASE_URL is not set. Add it to the environment or to "
+            "mcp-finlog/.env before starting the server.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     mcp.run()

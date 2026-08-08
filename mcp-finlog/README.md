@@ -22,14 +22,39 @@ Amounts are **real VND** (the old bot's x1000 convention is **not** used here �
 | `update_category` | Rename a category (no collision with another category) |
 | `delete_category` | Delete a category; transactions referencing it become NULL (FK `ON DELETE SET NULL`) |
 
+All tools accept a leading `telegram_user_id` parameter (optional — see [Multi-user support](#multi-user-support)).
+
+## Multi-user support
+
+Every tool accepts a leading `telegram_user_id: int | None = None` argument so a
+single server instance can serve many users at once (matching the original
+FinlogBot behavior). Per tool call:
+
+- If `telegram_user_id` is passed, the server resolves (find-or-create) the
+  matching Finlog user and operates on that user's data.
+- If it is omitted, the server falls back to `FINLOG_TELEGRAM_USER_ID` from the
+  environment.
+- If neither is available, the tool returns an `[ERROR]` string saying the user
+  could not be identified.
+
+A user that does not exist yet is created on first use (`username="mcp"`,
+`first_name="MCP"`). `FINLOG_TELEGRAM_USER_ID` is therefore only a fallback and
+is no longer required at startup — only `DATABASE_URL` is.
+
+**Category scope note:** `category` data (list/add/update/delete) is currently
+**shared** across users — the `categories` table has no per-user column yet (the
+schema is managed by FinlogBot's Alembic). The category tools still accept
+`telegram_user_id` so they can be scoped per user later, but for now they operate
+on the shared category set.
+
 ## Environment
 
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string shared with FinlogBot (required) |
-| `FINLOG_TELEGRAM_USER_ID` | Telegram user id whose data this server operates on (required). If the user does not exist yet, the server creates it (`username="mcp"`, `first_name="MCP"`) |
+| `FINLOG_TELEGRAM_USER_ID` | Telegram user id used as a fallback when a tool call does not pass `telegram_user_id` (optional). If the user does not exist yet, the server creates it (`username="mcp"`, `first_name="MCP"`) |
 
-Both are read from the process env or from `mcp-finlog/.env`. If either is missing, the server prints a clear error to stderr and exits with code 1.
+Both are read from the process env or from `mcp-finlog/.env`. If `DATABASE_URL` is missing, the server prints a clear error to stderr and exits with code 1.
 
 ## Setup & run
 
