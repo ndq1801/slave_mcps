@@ -10,6 +10,7 @@ Every server here works with **any** MCP client that supports stdio — opencode
 |---|---|---|
 | [`mcp-daily-report/`](mcp-daily-report/README.md) | Operates the Daily Report work app (leave requests, daily reports, overtime) | `DAILY_REPORT_*` |
 | [`mcp-slack-autoresponder/`](mcp-slack-autoresponder/README.md) | Slack Socket Mode listener: auto-replies to DMs/mentions after a countdown if you did not reply | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_USER_TOKEN`, `SLACK_USER_ID`, ... |
+| [`mcp-finlog/`](mcp-finlog/README.md) | Finlog income/expense/loan manager (shared PostgreSQL with the FinlogBot) | `DATABASE_URL`, `FINLOG_TELEGRAM_USER_ID` |
 
 ## Quick start (local use)
 

@@ -1,0 +1,4 @@
+"""
+User domain aggregate definitions.
+"""
+

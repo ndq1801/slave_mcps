@@ -1,0 +1,4 @@
+"""
+Transactions domain aggregate definitions.
+"""
+

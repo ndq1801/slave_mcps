@@ -1,6 +1,13 @@
 # Dependencies (installed locally, never committed)
 node_modules/
 
+# Python
+__pycache__/
+*.py[cod]
+
+# Artifacts
+codemap.md
+
 # Environment / secrets (per-machine, never committed)
 .env
 *.env.local
