@@ -5,6 +5,17 @@ alwaysApply: true
 
 # mcp-hub — Agent Rules
 
+## Repository Map
+
+A full codemap is available at `codemap.md` in the project root.
+
+Before working on any task, read `codemap.md` to understand:
+- Project architecture and entry points
+- Directory responsibilities and design patterns
+- Data flow and integration points between modules
+
+For deep work on a specific folder, also read that folder's `codemap.md`.
+
 ## Project overview
 
 `mcp-hub` is a collection of self-contained MCP stdio servers (Node.js or Python). One folder per server (`mcp-daily-report/`, `mcp-finlog/`, ...). Each server keeps its credentials in its own `.env` (gitignored) or receives them from the host process environment.
@@ -27,6 +38,7 @@ alwaysApply: true
 6. Every new server must ship with `README.md` (description, tool list, env table, client config example) and `.env.example`.
 7. Write operations that mutate app data should be serialized (one at a time) to keep verification and flash messages unambiguous.
 8. **Multi-user identity convention**: servers that manage per-user data must accept `telegram_user_id: int | None = None` as the first parameter of every tool. Resolve the user per call (find-or-create by telegram id, like `mcp-finlog`); when the parameter is omitted, fall back to a dedicated env var (e.g. `FINLOG_TELEGRAM_USER_ID`). Never ask the model for credentials (see rule 4) — identity always comes from the host (assistant-bot) or the env fallback.
+9. **Self-describing tool descriptions**: every tool description must state BOTH what the tool does AND when to use it (trigger conditions, prerequisites, what it should NOT be used for). The host's system prompt is MCP-agnostic and will never mention any server by name — the model decides purely from name + description + schema. Follow the `get_app_map` model ("Call this FIRST when exploring the app..."). Never rely on the host knowing the server's context, routes, or other tools.
 
 ## Verification
 

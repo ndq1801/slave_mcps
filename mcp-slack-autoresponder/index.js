@@ -344,7 +344,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "send_slack_message",
-        description: "Gửi tin nhắn phản hồi trực tiếp tới Slack channel hoặc thread cụ thể.",
+        description: "Gửi ngay một tin nhắn thủ công tới Slack channel hoặc thread cụ thể (không chờ đếm ngược auto-reply). Dùng khi cần phản hồi tức thì. Yêu cầu bộ lắng nghe đang chạy: nếu chưa kết nối, gọi start_slack_listener trước.",
         inputSchema: {
           type: "object",
           properties: {

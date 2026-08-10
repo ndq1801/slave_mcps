@@ -7,6 +7,7 @@ __pycache__/
 
 # Artifacts
 codemap.md
+.slim/
 
 # Environment / secrets (per-machine, never committed)
 .env

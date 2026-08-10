@@ -248,7 +248,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_page",
-        description: "Fetches a page from the app (e.g. '/admin', '/admin/users') with the active session. Returns status, the Inertia page component name when available, page props, and optionally a body preview.",
+        description: "Fetches a page from the app (e.g. '/admin', '/admin/users') with the active session. Returns status, the Inertia page component name when available, page props, and optionally a body preview. Use AFTER calling get_app_map, when you need to read data from a specific route that has no dedicated tool (e.g. GET /profile, GET /daily-reports). Call this for reading only - do NOT use it to mutate data.",
         inputSchema: {
           type: "object",
           properties: {
@@ -260,7 +260,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "post_data",
-        description: "Submits data to the app (form fields or JSON body) with the active session and CSRF token. Returns status and response preview.",
+        description: "Low-level fallback that submits raw data (form fields or JSON body) to the app with the active session and CSRF token. Returns status and response preview. Use ONLY for mutations NOT covered by the dedicated submit_daily_report / submit_request / register_overtime tools (e.g. PUT /user-requests/{id} to edit a pending request). Prefer the dedicated tools whenever they fit - do NOT use this to duplicate their functionality.",
         inputSchema: {
           type: "object",
           properties: {
