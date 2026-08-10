@@ -248,12 +248,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_page",
-        description: "Fetches a page from the app (e.g. '/admin', '/admin/users') with the active session. Returns status, the Inertia page component name when available, page props, and optionally a body preview. Use AFTER calling get_app_map, when you need to read data from a specific route that has no dedicated tool (e.g. GET /profile, GET /daily-reports). Call this for reading only - do NOT use it to mutate data.",
+        description: "Fetches a page from the app (e.g. '/admin', '/admin/users') with the active session. Returns status, the Inertia page component name when available, page props, and optionally a body preview. Use AFTER calling get_app_map, when you need to read data from a specific route that has no dedicated tool (e.g. GET /profile, GET /daily-reports). Call this for reading only - do NOT use it to mutate data. Set rawProps=true to get ONLY the page props as raw JSON (no status/preview text, no truncation) - for programmatic consumers that need to parse the data.",
         inputSchema: {
           type: "object",
           properties: {
             path: { type: "string", description: "Path within the app, e.g. '/admin' or '/admin/users'. Must stay on the app host." },
             includeBody: { type: "boolean", description: "Include a preview of the raw response body (default false)." },
+            rawProps: { type: "boolean", description: "Return only the page props as raw JSON instead of the human-readable summary (default false)." },
           },
           required: ["path"],
         },
@@ -423,6 +424,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const res = await fetchWithRedirects(args.path);
         const text = await res.text();
         const pageData = extractPageData(text);
+        if (args.rawProps) {
+          // Programmatic mode: pure props JSON, no preview text or truncation,
+          // so machine consumers (e.g. the assistant-bot task executor) can
+          // json.loads() it directly.
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(pageData ? pageData.props : {}),
+            }],
+          };
+        }
         const info = {
           status: res.status,
           finalUrl: res.url,
