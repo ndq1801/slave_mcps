@@ -4,3 +4,4 @@ psycopg2-binary
 pydantic-settings
 tzdata  # required by Python zoneinfo on Windows
 openpyxl  # required by export_transactions (xlsx format)
+alembic>=1.12.0  # database migrations
