@@ -1,0 +1,22 @@
+{
+  "name": "mcp-obsidian",
+  "version": "1.0.0",
+  "description": "MCP stdio server for an Obsidian vault: list, read, search, create, append and update markdown notes. The vault path is config-driven (OBSIDIAN_VAULT_PATH) so the same server works for any agent or machine.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "obsidian",
+    "notes",
+    "markdown",
+    "vault"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^16.4.7"
+  }
+}
