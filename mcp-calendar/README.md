@@ -41,6 +41,28 @@ copy .env.example .env   # then fill in your own credentials (never commit .env)
 node index.js            # speaks JSON-RPC over stdio; spawn it from an MCP client
 ```
 
+## Get a refresh token (one-time)
+
+The refresh token comes from running the Google OAuth consent flow once in a
+browser. This server ships a helper: `scripts/get-refresh-token.mjs`.
+
+Run it on a machine **with a browser** (your PC, not a headless server), with
+the client id/secret available (either in `.env` or as env vars):
+
+```bash
+GOOGLE_CALENDAR_CLIENT_ID=... GOOGLE_CALENDAR_CLIENT_SECRET=... \
+  node scripts/get-refresh-token.mjs
+```
+
+It prints a Google consent URL. Open it, sign in as the Google account whose
+calendar you want to use, and approve. The script then prints
+`GOOGLE_CALENDAR_REFRESH_TOKEN=...` - copy that value into `.env`.
+
+Before running it you need: a Google Cloud project with the Google Calendar
+API enabled, an OAuth 2.0 **Desktop** client, and the OAuth consent screen set
+to External and **published to production** (otherwise the refresh token
+expires after 7 days).
+
 ## Client configuration
 
 ```json
