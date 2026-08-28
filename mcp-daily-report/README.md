@@ -49,7 +49,7 @@ node index.js            # speaks JSON-RPC over stdio; spawn it from an MCP clie
 }
 ```
 
-The server loads `.env` from its own folder, so most clients need no extra `environment` block. When spawned by `assistant-bot`, credentials come from the bot's environment instead (no `.env` needed here).
+The server loads `.env` from its own folder, so most clients need no extra `environment` block. When spawned by a host agent, credentials come from the host process's environment instead (no `.env` needed here).
 
 ## Behavior notes
 
