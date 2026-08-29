@@ -44,10 +44,88 @@ function getCalendarClient() {
   return google.calendar({ version: "v3", auth });
 }
 
-function isoString(v) {
-  // Accept an ISO string as-is; otherwise fall back to now / +7d.
-  if (v && !Number.isNaN(Date.parse(v))) return new Date(v).toISOString();
+function isoString(v, tz) {
+  // Accept a full ISO date-time as-is. A date-only "YYYY-MM-DD" is interpreted
+  // at 00:00 wall-clock in tz (NOT UTC) so local all-day/early events are not
+  // missed. Invalid input falls back to null (caller uses defaults).
+  if (!v) return null;
+  if (isDateOnly(v)) return dateOnlyToISO(v, tz || config.timezone);
+  if (!Number.isNaN(Date.parse(v))) return new Date(v).toISOString();
   return null;
+}
+
+// Convert a date-only query (YYYY-MM-DD) to the ISO instant of 00:00 wall-clock
+// in the given IANA timezone. Binary-searches the UTC instant whose local
+// wall-clock equals exactly that target, which stays correct across DST
+// transitions (repeated twice a year, so a linear scan is wasteful).
+function dateOnlyToISO(dateStr, tz) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const partsOf = (date) => {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date);
+    const get = (t) => (parts.find((p) => p.type === t) || {}).value;
+    return `${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+  };
+  const target = `${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")} 00:00:00`;
+  let lo = Date.UTC(y, m - 1, d, 12) - 48 * 3600 * 1000;
+  let hi = Date.UTC(y, m - 1, d, 12) + 48 * 3600 * 1000;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (partsOf(new Date(mid)) < target) lo = mid;
+    else hi = mid;
+  }
+  return new Date(Math.round((lo + hi) / 2)).toISOString();
+}
+
+// ---------- All-day vs timed event parsing ----------
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isDateOnly(v) {
+  return typeof v === "string" && DATE_ONLY_RE.test(v);
+}
+
+// Google Calendar events have two start/end shapes: all-day events use
+// { date } (and MUST NOT carry a timeZone), timed events use
+// { dateTime, timeZone }. Pick the right shape for each bound independently.
+function timeField(v, tz) {
+  if (isDateOnly(v)) return { date: v };
+  return { dateTime: v, timeZone: tz };
+}
+
+// Google's all-day end date is exclusive: a one-day event must end on the NEXT
+// day (start=2026-09-01 end=2026-09-02). Guard against zero/negative ranges,
+// and against mixing an all-day bound with a timed bound.
+function assertEventRange(start, end) {
+  if (isDateOnly(start) !== isDateOnly(end)) {
+    throw new Error(
+      "start and end must both be date-only (YYYY-MM-DD, all-day) or both be date-times — don't mix forms"
+    );
+  }
+  if (isDateOnly(start) && end <= start) {
+    throw new Error(
+      `all-day end must be AFTER start (end is exclusive): start=${start} end=${end}`
+    );
+  }
+  if (!isDateOnly(start) && Date.parse(start) >= Date.parse(end)) {
+    throw new Error(`end must be after start: ${start} >= ${end}`);
+  }
+}
+
+// A timed bound must be a parseable date-time; a date-only bound is handled by
+// isDateOnly. Catch garbage locally instead of round-tripping Google's error.
+function assertValidTimeInput(v) {
+  if (!isDateOnly(v) && Number.isNaN(Date.parse(v))) {
+    throw new Error(`invalid start/end value (expected ISO 8601 date-time or YYYY-MM-DD): ${v}`);
+  }
 }
 
 function fmtEvent(ev) {
@@ -59,6 +137,9 @@ function fmtEvent(ev) {
     status: ev.status || "confirmed",
     start: ev.start || null,
     end: ev.end || null,
+    htmlLink: ev.htmlLink || null,
+    hangoutLink: ev.hangoutLink || null,
+    recurrence: ev.recurrence || null,
     created: ev.created || null,
     updated: ev.updated || null,
     attendees: (ev.attendees || []).map((a) => ({ email: a.email, displayName: a.displayName || null, responseStatus: a.responseStatus || null })),
@@ -86,14 +167,14 @@ async function listEvents(args) {
   const now = Date.now();
   const defaultFrom = new Date(now).toISOString();
   const defaultTo = new Date(now + 7 * 24 * 3600 * 1000).toISOString();
-  const timeMin = isoString(args.timeMin) || defaultFrom;
-  const timeMax = isoString(args.timeMax) || defaultTo;
+  const timeMin = isoString(args.timeMin, config.timezone) || defaultFrom;
+  const timeMax = isoString(args.timeMax, config.timezone) || defaultTo;
   const res = await cal.events.list({
     calendarId: args.calendarId || config.calendarId,
     timeMin,
     timeMax,
     q: args.query || undefined,
-    maxResults: args.maxResults || 50,
+    maxResults: Math.min(args.maxResults || 50, 250),
     singleEvents: true,
     orderBy: "startTime",
     timeZone: config.timezone,
@@ -112,12 +193,16 @@ async function createEvent(args) {
   const cal = getCalendarClient();
   if (!args.summary) throw new Error("summary is required");
   if (!args.start || !args.end) throw new Error("start and end are required (ISO 8601)");
+  assertValidTimeInput(args.start);
+  assertValidTimeInput(args.end);
+  assertEventRange(args.start, args.end);
+  const tz = args.tz || config.timezone;
   const ev = {
     summary: args.summary,
     description: args.description || undefined,
     location: args.location || undefined,
-    start: { dateTime: args.start, timeZone: args.tz || config.timezone },
-    end: { dateTime: args.end, timeZone: args.tz || config.timezone },
+    start: timeField(args.start, tz),
+    end: timeField(args.end, tz),
   };
   const res = await cal.events.insert({ calendarId: args.calendarId || config.calendarId, requestBody: ev });
   return fmtEvent(res.data);
@@ -126,12 +211,18 @@ async function createEvent(args) {
 async function updateEvent(args) {
   const cal = getCalendarClient();
   if (!args.eventId) throw new Error("eventId is required");
+  if (args.start !== undefined) assertValidTimeInput(args.start);
+  if (args.end !== undefined) assertValidTimeInput(args.end);
+  if (args.start !== undefined && args.end !== undefined) {
+    assertEventRange(args.start, args.end);
+  }
+  const tz = args.tz || config.timezone;
   const body = {};
   if (args.summary !== undefined) body.summary = args.summary;
   if (args.description !== undefined) body.description = args.description;
   if (args.location !== undefined) body.location = args.location;
-  if (args.start !== undefined) body.start = { dateTime: args.start, timeZone: args.tz || config.timezone };
-  if (args.end !== undefined) body.end = { dateTime: args.end, timeZone: args.tz || config.timezone };
+  if (args.start !== undefined) body.start = timeField(args.start, tz);
+  if (args.end !== undefined) body.end = timeField(args.end, tz);
   const res = await cal.events.patch({ calendarId: args.calendarId || config.calendarId, eventId: args.eventId, requestBody: body });
   return fmtEvent(res.data);
 }
@@ -157,15 +248,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "list_events",
         description:
-          "Lists events in a date range (default: now to +7 days). Accepts timeMin/timeMax as ISO 8601, an optional query (match summary/description/location), calendar_id, and maxResults. Returns summary/start/end/details per event. Use to see what is scheduled, check an upcoming meeting, or find free time. Read-only.",
+          "Lists events in a date range (default: now to +7 days). Accepts timeMin/timeMax as ISO 8601 date-times OR date-only YYYY-MM-DD (interpreted at 00:00 in the configured timezone), an optional query (match summary/description/location), calendar_id, and maxResults (capped at 250). Returns summary/start/end/htmlLink/hangoutLink/details per event. Use to see what is scheduled, check an upcoming meeting, or find free time. Read-only.",
         inputSchema: {
           type: "object",
           properties: {
-            timeMin: { type: "string", description: "Start of range, ISO 8601 (default: now)." },
-            timeMax: { type: "string", description: "End of range, ISO 8601 (default: +7 days)." },
+            timeMin: { type: "string", description: "Start of range. ISO 8601 date-time, or date-only YYYY-MM-DD (start of that day, configured timezone). Default: now." },
+            timeMax: { type: "string", description: "End of range. ISO 8601 date-time, or date-only YYYY-MM-DD (start of that day, configured timezone). Default: +7 days." },
             query: { type: "string", description: "Optional text to search in event summary/description/location." },
             calendar_id: { type: "string", description: "Calendar id (default: the configured one)." },
-            maxResults: { type: "number", description: "Max events to return (default 50)." },
+            maxResults: { type: "number", description: "Max events to return (default 50, capped at 250)." },
           },
           required: [],
         },
@@ -186,16 +277,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "create_event",
         description:
-          "Creates a new event. Requires summary and a start/end (ISO 8601). Optional description, location and calendar_id. Use to add meetings, deadlines or reminders to the calendar; it will appear on any device synced to this Google calendar.",
+          "Creates a new event. Requires summary and a start/end. For timed events pass start/end as ISO 8601 date-times (e.g. 2026-08-28T10:00:00); for all-day events pass date-only YYYY-MM-DD (e.g. 2026-08-28) in BOTH start and end, and remember the end date is exclusive (a one-day event on 2026-08-28 uses start=2026-08-28 end=2026-08-29). Optional description, location, calendar_id and tz. It will appear on any device synced to this Google calendar.",
         inputSchema: {
           type: "object",
           properties: {
             summary: { type: "string", description: "Event title." },
-            start: { type: "string", description: "Start date-time, ISO 8601 (e.g. 2026-08-28T10:00:00)." },
-            end: { type: "string", description: "End date-time, ISO 8601." },
+            start: { type: "string", description: "Start. Date-time ISO 8601 (e.g. 2026-08-28T10:00:00) for timed events, or date-only YYYY-MM-DD (e.g. 2026-08-28) for all-day events." },
+            end: { type: "string", description: "End. Same forms as start. Exclusive for all-day: the day AFTER the last day (start=2026-08-28 end=2026-08-29 = one day)." },
             description: { type: "string", description: "Optional description." },
             location: { type: "string", description: "Optional location." },
-            tz: { type: "string", description: "Time zone for the event (default: the configured one)." },
+            tz: { type: "string", description: "Time zone for timed events (ignored for all-day; default: the configured one)." },
             calendar_id: { type: "string", description: "Calendar id (default: the configured one)." },
           },
           required: ["summary", "start", "end"],
@@ -204,7 +295,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "update_event",
         description:
-          "Updates an existing event (partial): change summary, description, location, and/or start/end. Requires the event id. Any field omitted is left unchanged.",
+          "Updates an existing event (partial): change summary, description, location, and/or start/end. Requires the event id. Any field omitted is left unchanged. start/end accept the same forms as create_event: ISO 8601 date-times for timed events, or date-only YYYY-MM-DD for all-day (keep both bounds in the same form, and remember all-day end is exclusive).",
         inputSchema: {
           type: "object",
           properties: {
@@ -212,9 +303,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             summary: { type: "string", description: "New title." },
             description: { type: "string", description: "New description." },
             location: { type: "string", description: "New location." },
-            start: { type: "string", description: "New start date-time, ISO 8601." },
-            end: { type: "string", description: "New end date-time, ISO 8601." },
-            tz: { type: "string", description: "Time zone for the new times." },
+            start: { type: "string", description: "New start. Date-time ISO 8601, or date-only YYYY-MM-DD for all-day (keep same form as end)." },
+            end: { type: "string", description: "New end. Date-time ISO 8601, or date-only YYYY-MM-DD for all-day (exclusive: the day after the last day)." },
+            tz: { type: "string", description: "Time zone for the new times (ignored for all-day)." },
             calendar_id: { type: "string", description: "Calendar id (default: the configured one)." },
           },
           required: ["eventId"],

@@ -19,9 +19,24 @@ owner's own Google Calendar credentials.
 | `get_calendar_info` | Config state, calendar id, timezone, calendar summary (call first to confirm wiring) |
 | `list_events` | List events in a date range (default now → +7d), optional full-text query |
 | `get_event` | Read a single event by id (description, attendees, location) |
-| `create_event` | Create a new event (summary + start/end required) |
+| `create_event` | Create a new event (summary + start/end required; timed or all-day) |
 | `update_event` | Update an existing event (partial: title, description, location, times) |
 | `delete_event` | Delete an event by id (destructive) |
+
+### Timed vs all-day events
+
+`create_event` / `update_event` accept `start`/`end` in either form:
+
+- **Timed events** — ISO 8601 date-times, e.g. `2026-08-28T10:00:00`. Both bounds
+  are sent as `{ dateTime, timeZone }`.
+- **All-day events** — date-only `YYYY-MM-DD`, e.g. `2026-08-28`. Both bounds are
+  sent as `{ date }` (Google requires **no** `timeZone` on all-day events).
+
+Rules enforced by the server:
+
+- `start` and `end` must use the **same form** (both date-only or both date-times).
+- The all-day `end` is **exclusive** — a one-day event on `2026-08-28` uses
+  `start=2026-08-28`, `end=2026-08-29`. `end <= start` is rejected.
 
 ## Environment
 
