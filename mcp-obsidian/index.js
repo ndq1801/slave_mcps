@@ -6,7 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import path from "path";
-import { promises as fs } from "fs";
+import { promises as fs, realpathSync } from "fs";
 
 // Load .env from this server's own directory (works no matter what cwd the
 // client spawns the process in). Values already present in the real
@@ -26,11 +26,37 @@ const server = new Server(
 
 // ---------- Path safety ----------
 // Every operation must stay inside the vault root; reject anything that would
-// traverse outside it (e.g. ".." or absolute paths escaping the vault).
+// traverse outside it (e.g. "..", absolute paths, or symlinks pointing out).
 function resolveVaultPath(rel) {
   const target = path.resolve(vaultRoot, rel || ".");
   if (target !== vaultRoot && !target.startsWith(vaultRoot + path.sep)) {
     throw new Error(`Path escapes the vault root: ${rel}`);
+  }
+  // Symlink check: only meaningful once the vault exists (a vault that has not
+  // been created yet cannot host a symlink). Resolve the closest existing
+  // ancestor of the target and confirm it still lives under the real vault
+  // root — this blocks vault symlinks pointing outside while still allowing
+  // writes to not-yet-existing notes.
+  let vaultReal;
+  try {
+    vaultReal = realpathSync(vaultRoot);
+  } catch {
+    return target; // vault not created yet; lexical check above already passed
+  }
+  let ancestor = target;
+  let ancestorReal = null;
+  while (true) {
+    try {
+      ancestorReal = realpathSync(ancestor);
+      break;
+    } catch {
+      if (ancestor === path.dirname(ancestor)) break;
+      ancestor = path.dirname(ancestor);
+    }
+  }
+  if (ancestorReal === null) return target;
+  if (ancestorReal !== vaultReal && !ancestorReal.startsWith(vaultReal + path.sep)) {
+    throw new Error(`Path escapes the vault root via symlink: ${rel}`);
   }
   return target;
 }
@@ -59,6 +85,7 @@ async function collectMarkdown(absDir) {
     return out;
   }
   for (const e of entries) {
+    if (e.name.startsWith(".")) continue; // skip hidden/system dirs & files (.git, .obsidian, ...)
     const full = path.join(absDir, e.name);
     if (e.isDirectory()) {
       out.push(...(await collectMarkdown(full)));
@@ -71,6 +98,14 @@ async function collectMarkdown(absDir) {
 
 function toRel(abs) {
   return path.relative(vaultRoot, abs);
+}
+
+// Write atomically (temp file + rename) so a crash mid-write never leaves a
+// corrupted/truncated note behind.
+async function atomicWrite(abs, content) {
+  const tmp = `${abs}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmp, content, "utf8");
+  await fs.rename(tmp, abs);
 }
 
 // ---------- Tool implementations ----------
@@ -89,7 +124,8 @@ async function listNotes(args) {
   const relDir = (args.path || "").trim();
   const absDir = resolveVaultPath(relDir);
   const files = await collectMarkdown(absDir);
-  return files.map(toRel).filter((r) => !r.startsWith("..")).sort();
+  const paths = files.map(toRel).filter((r) => !r.startsWith("..")).sort();
+  return { total: paths.length, paths };
 }
 
 async function getNote(args) {
@@ -117,19 +153,22 @@ async function searchNotes(args) {
   if (!query) throw new Error("query is required");
   const relDir = (args.path || "").trim();
   const absDir = resolveVaultPath(relDir);
+  const maxResults = Math.max(1, Math.min(args.maxResults || 20, 100));
   const files = await collectMarkdown(absDir);
   const matches = [];
+  const trimmed = [];
   for (const f of files) {
     try {
       const text = await fs.readFile(f, "utf8");
       if (text.toLowerCase().includes(query.toLowerCase())) {
         matches.push({ path: toRel(f), snippet: snippet(text, query) });
+        if (trimmed.length < maxResults) trimmed.push(matches[matches.length - 1]);
       }
     } catch {
       // skip unreadable files
     }
   }
-  return matches;
+  return { query, total: matches.length, truncated: matches.length > maxResults, matches: trimmed };
 }
 
 async function ensureVault() {
@@ -148,7 +187,7 @@ async function createNote(args) {
   } catch (e) {
     if (e.code !== "ENOENT") throw e; // not the access() ENOENT
   }
-  await fs.writeFile(abs, args.content ?? "", "utf8");
+  await atomicWrite(abs, args.content ?? "");
   return { path: toRel(abs), createdOrOverwritten: true };
 }
 
@@ -162,7 +201,7 @@ async function appendNote(args) {
     throw new Error(`Note not found: ${rel}`);
   }
   const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-  await fs.writeFile(abs, existing + sep + (args.content ?? ""), "utf8");
+  await atomicWrite(abs, existing + sep + (args.content ?? ""));
   return { path: toRel(abs), appended: true };
 }
 
@@ -174,8 +213,19 @@ async function updateNote(args) {
   } catch {
     throw new Error(`Note not found: ${rel}`);
   }
-  await fs.writeFile(abs, args.content ?? "", "utf8");
+  await atomicWrite(abs, args.content ?? "");
   return { path: toRel(abs), updated: true };
+}
+
+async function deleteNote(args) {
+  const rel = withMd((args.path || "").trim());
+  const abs = resolveVaultPath(rel);
+  try {
+    await fs.unlink(abs);
+  } catch {
+    throw new Error(`Note not found: ${rel}`);
+  }
+  return { path: toRel(abs), deleted: true };
 }
 
 // ---------- Tool declarations ----------
@@ -192,7 +242,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "list_notes",
         description:
-          "Lists markdown notes (.md) under the vault, optionally scoped to a subfolder. Returns vault-relative paths only (no content). Use to discover which notes exist before reading or editing. Set 'path' to a subfolder (e.g. 'Projects') to scope; omit to list the whole vault.",
+          "Lists markdown notes (.md) under the vault, optionally scoped to a subfolder. Returns { total, paths } with vault-relative paths only (no content). Use to discover which notes exist before reading or editing. Set 'path' to a subfolder (e.g. 'Projects') to scope; omit to list the whole vault.",
         inputSchema: {
           type: "object",
           properties: {
@@ -216,12 +266,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "search_notes",
         description:
-          "Searches note contents for a keyword (case-insensitive substring). Returns each matching note's vault-relative path and a short snippet around the match. Use to find information across the vault without reading every note. Optional 'path' scopes the search to a subfolder.",
+          "Searches note contents for a keyword (case-insensitive substring). Returns each matching note's vault-relative path and a short snippet around the match. Use to find information across the vault without reading every note. Optional 'path' scopes the search to a subfolder; optional 'maxResults' caps the snippets returned (default 20, max 100) — check 'total'/'truncated' for the full match count.",
         inputSchema: {
           type: "object",
           properties: {
             query: { type: "string", description: "Keyword to search for (case-insensitive)." },
             path: { type: "string", description: "Optional vault-relative subfolder to scope the search." },
+            maxResults: { type: "number", description: "Max matching notes to return snippets for (default 20, max 100)." },
           },
           required: ["query"],
         },
@@ -266,6 +317,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["path", "content"],
         },
       },
+      {
+        name: "delete_note",
+        description:
+          "Deletes a note by its vault-relative path. Fails if the note does not exist. This is destructive and irreversible — confirm the path before deleting.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Vault-relative note path to delete, e.g. 'Projects/Unused.md'." },
+          },
+          required: ["path"],
+        },
+      },
     ],
   };
 });
@@ -297,6 +360,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "update_note":
         result = await updateNote(args);
+        break;
+      case "delete_note":
+        result = await deleteNote(args);
         break;
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };

@@ -16,12 +16,23 @@ Credentials are never needed here — the vault is just files.
 | Tool | Purpose |
 |---|---|
 | `get_vault_info` | Resolved vault root path, whether it exists, note count. Call first to confirm wiring |
-| `list_notes` | List markdown notes (optionally in a subfolder), returns vault-relative paths |
+| `list_notes` | List markdown notes (optionally in a subfolder), returns `{ total, paths }` |
 | `get_note` | Read a note's full markdown content |
-| `search_notes` | Search note contents by keyword, returns matching paths + snippets |
+| `search_notes` | Search note contents by keyword; returns matching paths + snippets, capped by `maxResults` |
 | `create_note` | Create a new note (creates parent folders; refuses to overwrite unless `overwrite=true`) |
 | `append_note` | Append content to an existing note |
 | `update_note` | Replace the full content of an existing note |
+| `delete_note` | Delete a note by vault-relative path (destructive) |
+
+## Security notes
+
+- **Path safety**: every note path is resolved against the vault root (lexically
+  and via symlink-resolved realpath); anything that would escape the vault — via
+  `..`, absolute paths, or a symlink pointing outside — is rejected.
+- **Atomic writes**: notes are written to a temp file then renamed, so a crash
+  mid-write never leaves a truncated/corrupted note.
+- **No secrets**: the server never logs or returns absolute host paths, and needs
+  no credentials (the vault is just files).
 
 ## Environment
 
