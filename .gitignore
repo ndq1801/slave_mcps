@@ -21,3 +21,7 @@ codemap.md
 .vscode/
 .DS_Store
 Thumbs.db
+
+# OpenCode local config (machine-specific, never committed)
+.ignore
+opencode.json
