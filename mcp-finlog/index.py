@@ -516,9 +516,10 @@ def add_loan(
     target_telegram_user_id: int | None = None,
     amount: float,
     description: str,
+    category_id: Optional[int] = None,
     date: Optional[str] = None,
 ) -> Any:
-    """Record money you BORROWED (a debt you must repay, "đi vay") - NOT money you lent to others. No category. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
+    """Record money you BORROWED (a debt you must repay, "đi vay") - NOT money you lent to others. Category is optional via category_id. Amount is real VND (not x1000). Date is YYYY-MM-DD in the user's timezone, defaults to today.
 
     telegram_user_id: Telegram user id của người gọi; nếu bỏ trống dùng FINLOG_TELEGRAM_USER_ID.
     username/first_name/last_name/language_code: Caller's Telegram profile, used when creating/syncing the user.
@@ -547,6 +548,9 @@ def add_loan(
                 )
             tz = _zone_info_for(user)
             transaction_date = _parse_date(date, tz)
+            category_repo = SqlAlchemyCategoryRepository(session)
+            if category_id is not None and category_repo.get_by_id(category_id) is None:
+                return _error(f"Category {category_id} does not exist.")
             repo = SqlAlchemyTransactionRepository(session)
             tx = repo.create(
                 Transaction(
@@ -558,7 +562,7 @@ def add_loan(
                     transaction_date=transaction_date,
                     created_at=datetime.now(UTC),
                     updated_at=None,
-                    category_id=None,
+                    category_id=category_id,
                 )
             )
             return _tx_to_dict(
@@ -1200,9 +1204,12 @@ def get_report(
             totals = repo.get_summary_by_type_and_date_range(user_id, start, end)
             by_category = []
             if transaction_type is None:
-                breakdown_types = [TransactionType.EXPENSE, TransactionType.INCOME]
-            elif transaction_type in (TransactionType.LOAN, TransactionType.LENDING):
-                breakdown_types = []  # loans/lendings have no category
+                breakdown_types = [
+                    TransactionType.EXPENSE,
+                    TransactionType.INCOME,
+                    TransactionType.LOAN,
+                    TransactionType.LENDING,
+                ]
             else:
                 breakdown_types = [transaction_type]
             for t in breakdown_types:

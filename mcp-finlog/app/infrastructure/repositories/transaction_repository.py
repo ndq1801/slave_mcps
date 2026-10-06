@@ -237,7 +237,7 @@ class SqlAlchemyTransactionRepository(TransactionRepository):
     ) -> List[dict]:
         """Get total amount per category (joined with categories) within a date range.
 
-        Transactions without a category are not included (loan type has no category).
+        Transactions without a category are not included.
         """
         results = (
             self.session.query(
