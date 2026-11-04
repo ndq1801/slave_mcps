@@ -1,0 +1,22 @@
+{
+  "name": "mcp-backlog",
+  "version": "1.0.0",
+  "description": "MCP server for the Backlog team task-management app (Next.js frontend + JSON REST API): Bearer auth and raw API access. Credentials stay in .env, never exposed to the model.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "capture": "node capture-schema.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "backlog",
+    "task-management",
+    "rest-api"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^16.4.7"
+  }
+}

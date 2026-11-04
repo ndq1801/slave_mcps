@@ -25,3 +25,4 @@ Thumbs.db
 # OpenCode local config (machine-specific, never committed)
 .ignore
 opencode.json
+mcp-backlog/captures/
